@@ -21,8 +21,11 @@
 #include <atomic>
 #include <cctype>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <intrin.h>
 #include <mutex>
 #include <regex>
 #include <sstream>
@@ -47,11 +50,14 @@ struct RuntimeConfig {
     bool dumpData = true;
     bool logHttpHeaders = true;
     bool console = true;
-    bool redact = true;
+    bool redact = false;
     bool jsonl = true;
     bool namedPipe = true;
+    bool consoleColor = true;
+    bool callStack = true;
     bool loggingEnabled = true;
     int maxDumpBytes = 4096; // Set SOCKETUNIVERSAL_MAX_DUMP_BYTES=0 for no cap.
+    int maxCallStackFrames = 8;
     unsigned long long rotateBytes = 10ull * 1024ull * 1024ull;
     int rotateFiles = 5;
     DWORD threadFilter = 0;
@@ -73,10 +79,22 @@ struct HttpHandleInfo {
 struct PayloadPreview {
     std::string text;
     std::string hex;
+    std::string scriptKind;
     size_t previewBytes = 0;
     bool textLike = false;
     bool truncated = false;
     bool redacted = false;
+};
+
+struct EndpointParts {
+    std::string server;
+    std::string port;
+};
+
+struct CaptureContext {
+    std::string returnSite;
+    std::vector<std::string> callStack;
+    std::string scriptHint;
 };
 
 struct OverlappedOperation {
@@ -93,6 +111,7 @@ static FILE* g_LogFile = nullptr;
 static FILE* g_JsonlFile = nullptr;
 static HANDLE g_Pipe = INVALID_HANDLE_VALUE;
 static bool g_PipeConnected = false;
+static WORD g_DefaultConsoleAttributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
 static std::mutex g_LogMutex;
 static std::mutex g_StateMutex;
 static std::mutex g_DynamicHookMutex;
@@ -171,6 +190,10 @@ static int (WINAPI* Real_SSL_read)(void*, void*, int) = nullptr;
 static int (WINAPI* Real_SSL_write)(void*, const void*, int) = nullptr;
 static int (WINAPI* Real_SSL_read_ex)(void*, void*, size_t, size_t*) = nullptr;
 static int (WINAPI* Real_SSL_write_ex)(void*, const void*, size_t, size_t*) = nullptr;
+static int (*Real_luaL_loadbufferx)(void*, const char*, size_t, const char*, const char*) = nullptr;
+static int (*Real_luaL_loadbuffer)(void*, const char*, size_t, const char*) = nullptr;
+static int (*Real_luaL_loadstring)(void*, const char*) = nullptr;
+static int (*Real_lua_pcallk)(void*, int, int, int, intptr_t, void*) = nullptr;
 static HMODULE(WINAPI* Real_LoadLibraryA)(LPCSTR) = nullptr;
 static HMODULE(WINAPI* Real_LoadLibraryW)(LPCWSTR) = nullptr;
 static HMODULE(WINAPI* Real_LoadLibraryExA)(LPCSTR, HANDLE, DWORD) = nullptr;
@@ -419,6 +442,248 @@ private:
 
 #define SOCKETU_GUARD_RETURN(expr) HookReentrancyGuard hookGuard; if (hookGuard.nested()) { return (expr); }
 
+std::string HexAddress(uintptr_t value)
+{
+    std::ostringstream out;
+    out << "0x" << std::hex << std::uppercase << value;
+    return out.str();
+}
+
+std::string ModuleSiteFromAddress(void* address)
+{
+    if (!address) {
+        return "undefined";
+    }
+
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(address),
+        &module) || !module) {
+        return "unknown!" + HexAddress(reinterpret_cast<uintptr_t>(address));
+    }
+
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(module, path, static_cast<DWORD>(sizeof(path)))) {
+        return "unknown!" + HexAddress(reinterpret_cast<uintptr_t>(address));
+    }
+
+    const char* name = PathFindFileNameA(path);
+    uintptr_t offset = reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module);
+    return std::string(name ? name : path) + " + " + HexAddress(offset);
+}
+
+std::string ModuleNameFromAddress(void* address)
+{
+    HMODULE module = nullptr;
+    if (!address ||
+        !GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(address),
+            &module) ||
+        !module) {
+        return {};
+    }
+
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(module, path, static_cast<DWORD>(sizeof(path)))) {
+        return {};
+    }
+
+    const char* name = PathFindFileNameA(path);
+    return name ? name : path;
+}
+
+bool IsOwnModuleAddress(void* address)
+{
+    HMODULE module = nullptr;
+    return address &&
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(address),
+            &module) &&
+        module == g_Module;
+}
+
+bool IsSystemOrHookModuleName(const std::string& moduleName)
+{
+    std::string name = Lower(moduleName);
+    return name.empty() ||
+        name == "socketuniversal.dll" ||
+        name == "ws2_32.dll" ||
+        name == "mswsock.dll" ||
+        name == "winhttp.dll" ||
+        name == "wininet.dll" ||
+        name == "secur32.dll" ||
+        name == "schannel.dll" ||
+        name == "kernel32.dll" ||
+        name == "kernelbase.dll" ||
+        name == "ntdll.dll" ||
+        name.find("vcruntime") != std::string::npos ||
+        name.find("ucrtbase") != std::string::npos;
+}
+
+std::string DetectScriptKindFromText(const std::string& value)
+{
+    if (value.empty()) {
+        return {};
+    }
+
+    std::string lower = Lower(value);
+    if (lower.find("\x1blu") != std::string::npos || lower.find(".lua") != std::string::npos ||
+        lower.find("lua_") != std::string::npos ||
+        (lower.find("function ") != std::string::npos && lower.find(" end") != std::string::npos)) {
+        return "lua";
+    }
+
+    if (lower.find(".gsc") != std::string::npos || lower.find("maps/mp/gametypes") != std::string::npos ||
+        lower.find("level.") != std::string::npos || lower.find("self ") != std::string::npos ||
+        lower.find("endon(") != std::string::npos || lower.find("waittill(") != std::string::npos) {
+        return "gsc";
+    }
+
+    if (lower.find(".gs2") != std::string::npos || lower.find("gs2") != std::string::npos) {
+        return "gs2";
+    }
+
+    if (lower.find(".nut") != std::string::npos || lower.find("squirrel") != std::string::npos) {
+        return "squirrel";
+    }
+
+    if (lower.find(".as") != std::string::npos || lower.find("angelscript") != std::string::npos) {
+        return "angelscript";
+    }
+
+    if (lower.find("<script") != std::string::npos || lower.find(".js") != std::string::npos ||
+        lower.find("function(") != std::string::npos || lower.find("=>") != std::string::npos) {
+        return "javascript";
+    }
+
+    return {};
+}
+
+std::string DetectScriptKindFromStack(const std::vector<std::string>& frames)
+{
+    for (const std::string& frame : frames) {
+        std::string lower = Lower(frame);
+        if (lower.find("lua") != std::string::npos) return "lua";
+        if (lower.find("gsc") != std::string::npos) return "gsc";
+        if (lower.find("gs2") != std::string::npos) return "gs2";
+        if (lower.find("script") != std::string::npos) return "script-runtime";
+        if (lower.find("squirrel") != std::string::npos) return "squirrel";
+        if (lower.find("angel") != std::string::npos) return "angelscript";
+    }
+
+    return {};
+}
+
+CaptureContext CaptureContextForEvent()
+{
+    CaptureContext context;
+    if (!g_Config.callStack) {
+        context.returnSite = "disabled";
+        return context;
+    }
+
+    constexpr USHORT kMaxFrames = 48;
+    void* frames[kMaxFrames] = {};
+    USHORT captured = CaptureStackBackTrace(0, kMaxFrames, frames, nullptr);
+
+    std::string firstExternal;
+    std::string firstPreferred;
+    for (USHORT i = 0; i < captured; ++i) {
+        if (!frames[i] || IsOwnModuleAddress(frames[i])) {
+            continue;
+        }
+
+        std::string moduleName = ModuleNameFromAddress(frames[i]);
+        std::string site = ModuleSiteFromAddress(frames[i]);
+        if (firstExternal.empty()) {
+            firstExternal = site;
+        }
+
+        if (!IsSystemOrHookModuleName(moduleName)) {
+            if (firstPreferred.empty()) {
+                firstPreferred = site;
+            }
+            if (static_cast<int>(context.callStack.size()) < g_Config.maxCallStackFrames) {
+                context.callStack.push_back(site);
+            }
+        }
+    }
+
+    context.returnSite = !firstPreferred.empty() ? firstPreferred : (!firstExternal.empty() ? firstExternal : "undefined");
+    context.scriptHint = DetectScriptKindFromStack(context.callStack);
+    return context;
+}
+
+EndpointParts SplitEndpoint(const std::string& endpoint)
+{
+    EndpointParts parts;
+    if (endpoint.empty() || endpoint == "?") {
+        return parts;
+    }
+
+    std::string value = endpoint;
+    size_t slash = value.find('/');
+    if (slash != std::string::npos) {
+        value.resize(slash);
+    }
+
+    if (!value.empty() && value.front() == '[') {
+        size_t close = value.find(']');
+        if (close != std::string::npos) {
+            parts.server = value.substr(1, close - 1);
+            if (close + 2 <= value.size() && value[close + 1] == ':') {
+                parts.port = value.substr(close + 2);
+            }
+            return parts;
+        }
+    }
+
+    size_t colon = value.rfind(':');
+    if (colon != std::string::npos && value.find(':') == colon) {
+        parts.server = value.substr(0, colon);
+        parts.port = value.substr(colon + 1);
+    }
+    else {
+        parts.server = value;
+    }
+
+    return parts;
+}
+
+WORD ColorForEvent(const std::string& direction, const std::string& status, const std::string& scriptKind)
+{
+    std::string statusLower = Lower(status);
+    if (statusLower.find("fail") != std::string::npos || statusLower.find("error") != std::string::npos) {
+        return FOREGROUND_RED | FOREGROUND_INTENSITY;
+    }
+
+    if (!scriptKind.empty()) {
+        return FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+    }
+
+    std::string dir = Lower(direction);
+    if (dir.find("out") != std::string::npos || dir.find("send") != std::string::npos) {
+        return FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+    }
+
+    if (dir.find("in") != std::string::npos || dir.find("recv") != std::string::npos) {
+        return FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+    }
+
+    if (dir.find("tls") != std::string::npos) {
+        return FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+    }
+
+    if (dir.find("dns") != std::string::npos) {
+        return FOREGROUND_BLUE | FOREGROUND_GREEN;
+    }
+
+    return g_DefaultConsoleAttributes;
+}
+
 std::string JoinPath(const std::string& directory, const std::string& filename)
 {
     if (directory.empty()) {
@@ -542,7 +807,7 @@ void CloseNamedPipe()
     }
 }
 
-void WriteHumanLine(const std::string& message)
+void WriteHumanLine(const std::string& message, WORD color = 0)
 {
     std::string line = "[" + Timestamp() + "][pid:" +
         std::to_string(GetCurrentProcessId()) + " tid:" +
@@ -558,8 +823,16 @@ void WriteHumanLine(const std::string& message)
     if (g_Config.console) {
         FILE* console = stdout ? stdout : stderr;
         if (console) {
+            HANDLE consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+            bool colored = g_Config.consoleColor && color != 0 && consoleHandle != INVALID_HANDLE_VALUE;
+            if (colored) {
+                SetConsoleTextAttribute(consoleHandle, color);
+            }
             fputs(line.c_str(), console);
             fflush(console);
+            if (colored) {
+                SetConsoleTextAttribute(consoleHandle, g_DefaultConsoleAttributes);
+            }
         }
     }
 
@@ -610,6 +883,10 @@ void CreateDebugConsole()
     freopen_s(&fp, "CONOUT$", "w", stdout);
     freopen_s(&fp, "CONOUT$", "w", stderr);
     freopen_s(&fp, "CONIN$", "r", stdin);
+    CONSOLE_SCREEN_BUFFER_INFO consoleInfo = {};
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &consoleInfo)) {
+        g_DefaultConsoleAttributes = consoleInfo.wAttributes;
+    }
     SetConsoleTitleA("SocketUniversal Network Console");
 }
 
@@ -650,10 +927,13 @@ void LoadConfig()
     g_Config.dumpData = ParseBoolEnv("SOCKETUNIVERSAL_DUMP_DATA", true);
     g_Config.logHttpHeaders = ParseBoolEnv("SOCKETUNIVERSAL_LOG_HEADERS", true);
     g_Config.console = ParseBoolEnv("SOCKETUNIVERSAL_CONSOLE", true);
-    g_Config.redact = ParseBoolEnv("SOCKETUNIVERSAL_REDACT", true);
+    g_Config.redact = ParseBoolEnv("SOCKETUNIVERSAL_REDACT", false);
     g_Config.jsonl = ParseBoolEnv("SOCKETUNIVERSAL_JSONL", true);
     g_Config.namedPipe = ParseBoolEnv("SOCKETUNIVERSAL_PIPE", true);
+    g_Config.consoleColor = ParseBoolEnv("SOCKETUNIVERSAL_COLOR", true);
+    g_Config.callStack = ParseBoolEnv("SOCKETUNIVERSAL_CALLSTACK", true);
     g_Config.maxDumpBytes = ParseIntEnv("SOCKETUNIVERSAL_MAX_DUMP_BYTES", 4096);
+    g_Config.maxCallStackFrames = ParseIntEnv("SOCKETUNIVERSAL_CALLSTACK_FRAMES", 8);
     g_Config.rotateBytes = ParseUllEnv("SOCKETUNIVERSAL_ROTATE_BYTES", 10ull * 1024ull * 1024ull);
     g_Config.rotateFiles = ParseIntEnv("SOCKETUNIVERSAL_ROTATE_FILES", 5);
     g_Config.threadFilter = ParseDwordEnv("SOCKETUNIVERSAL_THREAD_FILTER", 0);
@@ -851,6 +1131,10 @@ PayloadPreview BuildPayloadPreview(const void* data, size_t length)
     preview.truncated = previewBytes < length;
 
     std::string compressionNote;
+    if (previewBytes >= 4 && bytes[0] == 0x1B && bytes[1] == 'L' && bytes[2] == 'u' && bytes[3] == 'a') {
+        preview.scriptKind = "lua-bytecode";
+    }
+
     if (previewBytes >= 2 && bytes[0] == 0x1F && bytes[1] == 0x8B) {
         compressionNote = "[gzip-compressed body; raw bytes shown]\n";
     }
@@ -878,6 +1162,7 @@ PayloadPreview BuildPayloadPreview(const void* data, size_t length)
             text = "[chunked decoded]\n" + decoded;
         }
 
+        preview.scriptKind = DetectScriptKindFromText(text);
         preview.text = RedactPatterns(text);
         preview.redacted = preview.text != text;
         return preview;
@@ -899,6 +1184,9 @@ PayloadPreview BuildPayloadPreview(const void* data, size_t length)
     }
 
     std::string rawText = compressionNote + ascii;
+    if (preview.scriptKind.empty()) {
+        preview.scriptKind = DetectScriptKindFromText(rawText);
+    }
     preview.text = RedactPatterns(rawText);
     preview.redacted = preview.text != rawText;
     return preview;
@@ -921,7 +1209,12 @@ std::string EndpointFromSockaddr(const sockaddr* address, int length)
         return "?";
     }
 
-    return std::string(host) + ":" + port;
+    std::string hostText = host;
+    if (hostText.find(':') != std::string::npos) {
+        hostText = "[" + hostText + "]";
+    }
+
+    return hostText + ":" + port;
 }
 
 void TrackSocket(SOCKET socket, const std::string& endpoint)
@@ -936,9 +1229,23 @@ void TrackSocket(SOCKET socket, const std::string& endpoint)
 
 std::string SocketEndpoint(SOCKET socket)
 {
-    std::lock_guard<std::mutex> lock(g_StateMutex);
-    auto it = g_SocketToHost.find(socket);
-    return it != g_SocketToHost.end() ? it->second : "?";
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        auto it = g_SocketToHost.find(socket);
+        if (it != g_SocketToHost.end()) {
+            return it->second;
+        }
+    }
+
+    sockaddr_storage address = {};
+    int addressLength = sizeof(address);
+    if (getpeername(socket, reinterpret_cast<sockaddr*>(&address), &addressLength) == 0) {
+        std::string endpoint = EndpointFromSockaddr(reinterpret_cast<sockaddr*>(&address), addressLength);
+        TrackSocket(socket, endpoint);
+        return endpoint;
+    }
+
+    return "?";
 }
 
 void TrackHandle(HINTERNET handle, const HttpHandleInfo& info)
@@ -994,10 +1301,13 @@ void WriteEventJson(
     const char* api,
     const char* direction,
     const std::string& endpoint,
+    const EndpointParts& endpointParts,
     long long bytes,
     const std::string& status,
     const std::string& detail,
-    const PayloadPreview* payload)
+    const PayloadPreview* payload,
+    const CaptureContext& context,
+    const std::string& scriptKind)
 {
     std::ostringstream json;
     json << "{";
@@ -1007,9 +1317,21 @@ void WriteEventJson(
     json << "\"api\":\"" << JsonEscape(api ? api : "") << "\",";
     json << "\"direction\":\"" << JsonEscape(direction ? direction : "") << "\",";
     json << "\"endpoint\":\"" << JsonEscape(endpoint) << "\",";
+    json << "\"server\":\"" << JsonEscape(endpointParts.server) << "\",";
+    json << "\"port\":\"" << JsonEscape(endpointParts.port) << "\",";
     json << "\"bytes\":" << bytes << ",";
     json << "\"status\":\"" << JsonEscape(status) << "\",";
-    json << "\"detail\":\"" << JsonEscape(detail) << "\"";
+    json << "\"detail\":\"" << JsonEscape(detail) << "\",";
+    json << "\"return_site\":\"" << JsonEscape(context.returnSite) << "\",";
+    json << "\"script\":\"" << JsonEscape(scriptKind) << "\",";
+    json << "\"call_stack\":[";
+    for (size_t i = 0; i < context.callStack.size(); ++i) {
+        if (i > 0) {
+            json << ",";
+        }
+        json << "\"" << JsonEscape(context.callStack[i]) << "\"";
+    }
+    json << "]";
 
     if (payload && payload->previewBytes > 0) {
         json << ",\"preview_bytes\":" << payload->previewBytes;
@@ -1040,13 +1362,25 @@ void LogEvent(
     }
 
     PayloadPreview payload = BuildPayloadPreview(payloadData, payloadLength);
+    CaptureContext context = CaptureContextForEvent();
+    EndpointParts endpointParts = SplitEndpoint(endpoint);
+    std::string scriptKind = !payload.scriptKind.empty() ? payload.scriptKind : context.scriptHint;
+    WORD color = ColorForEvent(direction ? direction : "", status, scriptKind);
 
     std::string message = FormatString(
-        "%s %s bytes=%lld endpoint=%s",
-        api ? api : "?",
+        "[%s] %s bytes=%lld server=%s port=%s endpoint=%s",
         direction ? direction : "?",
+        api ? api : "?",
         bytes,
+        endpointParts.server.empty() ? "?" : endpointParts.server.c_str(),
+        endpointParts.port.empty() ? "?" : endpointParts.port.c_str(),
         endpoint.empty() ? "?" : endpoint.c_str());
+
+    message += " return=" + context.returnSite;
+
+    if (!scriptKind.empty()) {
+        message += " script=" + scriptKind;
+    }
 
     if (!status.empty()) {
         message += " status=" + status;
@@ -1056,7 +1390,14 @@ void LogEvent(
         message += " " + detail;
     }
 
-    WriteHumanLine(message);
+    WriteHumanLine(message, color);
+
+    if (!context.callStack.empty()) {
+        WriteHumanLine("  call stack:", color);
+        for (size_t i = 0; i < context.callStack.size(); ++i) {
+            WriteHumanLine(FormatString("    [%zu] %s", i, context.callStack[i].c_str()), color);
+        }
+    }
 
     if (payload.previewBytes > 0) {
         std::string prefix = FormatString(
@@ -1064,18 +1405,18 @@ void LogEvent(
             payload.previewBytes,
             payload.truncated ? " truncated" : "",
             payload.redacted ? " redacted" : "");
-        WriteHumanLine(prefix);
+        WriteHumanLine(prefix, color);
 
         if (!payload.text.empty()) {
-            WriteHumanLine("  text: " + payload.text);
+            WriteHumanLine("  text: " + payload.text, color);
         }
 
         if (!payload.hex.empty()) {
-            WriteHumanLine("  hex: " + payload.hex);
+            WriteHumanLine("  hex: " + payload.hex, color);
         }
     }
 
-    WriteEventJson(api, direction, endpoint, bytes, status, detail, payload.previewBytes > 0 ? &payload : nullptr);
+    WriteEventJson(api, direction, endpoint, endpointParts, bytes, status, detail, payload.previewBytes > 0 ? &payload : nullptr, context, scriptKind);
 }
 
 void LogHeaders(const char* api, const std::string& endpoint, const std::string& headers)
@@ -1092,8 +1433,12 @@ void LogHeaders(const char* api, const std::string& endpoint, const std::string&
     payload.text = redacted;
     payload.previewBytes = redacted.size();
     payload.textLike = true;
+    payload.scriptKind = DetectScriptKindFromText(redacted);
     payload.redacted = redacted != headers;
-    WriteEventJson(api, "headers", endpoint, static_cast<long long>(headers.size()), "ok", "headers", &payload);
+    CaptureContext context = CaptureContextForEvent();
+    EndpointParts endpointParts = SplitEndpoint(endpoint);
+    std::string scriptKind = !payload.scriptKind.empty() ? payload.scriptKind : context.scriptHint;
+    WriteEventJson(api, "headers", endpoint, endpointParts, static_cast<long long>(headers.size()), "ok", "headers", &payload, context, scriptKind);
 }
 
 void LogBuffers(const char* api, const char* direction, const std::string& endpoint, LPWSABUF buffers, DWORD count)
@@ -1959,6 +2304,35 @@ int WINAPI Hook_SSL_write_ex(void* ssl, const void* buffer, size_t count, size_t
     return result;
 }
 
+int Hook_luaL_loadbufferx(void* state, const char* buffer, size_t size, const char* name, const char* mode)
+{
+    SOCKETU_GUARD_RETURN(Real_luaL_loadbufferx(state, buffer, size, name, mode));
+    LogEvent("luaL_loadbufferx", "script", "lua-runtime", static_cast<long long>(size), "lua", FormatString("chunk=%s mode=%s", name ? name : "?", mode ? mode : "?"), buffer, size);
+    return Real_luaL_loadbufferx(state, buffer, size, name, mode);
+}
+
+int Hook_luaL_loadbuffer(void* state, const char* buffer, size_t size, const char* name)
+{
+    SOCKETU_GUARD_RETURN(Real_luaL_loadbuffer(state, buffer, size, name));
+    LogEvent("luaL_loadbuffer", "script", "lua-runtime", static_cast<long long>(size), "lua", FormatString("chunk=%s", name ? name : "?"), buffer, size);
+    return Real_luaL_loadbuffer(state, buffer, size, name);
+}
+
+int Hook_luaL_loadstring(void* state, const char* text)
+{
+    SOCKETU_GUARD_RETURN(Real_luaL_loadstring(state, text));
+    size_t size = text ? strlen(text) : 0;
+    LogEvent("luaL_loadstring", "script", "lua-runtime", static_cast<long long>(size), "lua", {}, text, size);
+    return Real_luaL_loadstring(state, text);
+}
+
+int Hook_lua_pcallk(void* state, int nargs, int nresults, int errfunc, intptr_t ctx, void* k)
+{
+    SOCKETU_GUARD_RETURN(Real_lua_pcallk(state, nargs, nresults, errfunc, ctx, k));
+    LogEvent("lua_pcallk", "script", "lua-runtime", 0, "lua", FormatString("nargs=%d nresults=%d errfunc=%d", nargs, nresults, errfunc));
+    return Real_lua_pcallk(state, nargs, nresults, errfunc, ctx, k);
+}
+
 bool InstallDynamicHook(HMODULE module, const char* name, LPVOID hook, LPVOID* original)
 {
     if (!module || !name || !hook || !original || !g_MinHookInitialized.load()) {
@@ -2012,6 +2386,26 @@ void TryInstallOpenSslHooks(HMODULE module)
     }
 }
 
+void TryInstallScriptRuntimeHooks(HMODULE module)
+{
+    if (!module) {
+        return;
+    }
+
+    if (!Real_luaL_loadbufferx) {
+        InstallDynamicHook(module, "luaL_loadbufferx", reinterpret_cast<LPVOID>(Hook_luaL_loadbufferx), reinterpret_cast<LPVOID*>(&Real_luaL_loadbufferx));
+    }
+    if (!Real_luaL_loadbuffer) {
+        InstallDynamicHook(module, "luaL_loadbuffer", reinterpret_cast<LPVOID>(Hook_luaL_loadbuffer), reinterpret_cast<LPVOID*>(&Real_luaL_loadbuffer));
+    }
+    if (!Real_luaL_loadstring) {
+        InstallDynamicHook(module, "luaL_loadstring", reinterpret_cast<LPVOID>(Hook_luaL_loadstring), reinterpret_cast<LPVOID*>(&Real_luaL_loadstring));
+    }
+    if (!Real_lua_pcallk) {
+        InstallDynamicHook(module, "lua_pcallk", reinterpret_cast<LPVOID>(Hook_lua_pcallk), reinterpret_cast<LPVOID*>(&Real_lua_pcallk));
+    }
+}
+
 void ScanLoadedModulesForOpenSsl()
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
@@ -2025,6 +2419,7 @@ void ScanLoadedModulesForOpenSsl()
         do {
             HMODULE module = GetModuleHandleW(entry.szModule);
             TryInstallOpenSslHooks(module);
+            TryInstallScriptRuntimeHooks(module);
         } while (Module32NextW(snapshot, &entry));
     }
 
@@ -2036,6 +2431,7 @@ HMODULE WINAPI Hook_LoadLibraryA(LPCSTR fileName)
     SOCKETU_GUARD_RETURN(Real_LoadLibraryA(fileName));
     HMODULE module = Real_LoadLibraryA(fileName);
     TryInstallOpenSslHooks(module);
+    TryInstallScriptRuntimeHooks(module);
     return module;
 }
 
@@ -2044,6 +2440,7 @@ HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR fileName)
     SOCKETU_GUARD_RETURN(Real_LoadLibraryW(fileName));
     HMODULE module = Real_LoadLibraryW(fileName);
     TryInstallOpenSslHooks(module);
+    TryInstallScriptRuntimeHooks(module);
     return module;
 }
 
@@ -2052,6 +2449,7 @@ HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR fileName, HANDLE file, DWORD flags)
     SOCKETU_GUARD_RETURN(Real_LoadLibraryExA(fileName, file, flags));
     HMODULE module = Real_LoadLibraryExA(fileName, file, flags);
     TryInstallOpenSslHooks(module);
+    TryInstallScriptRuntimeHooks(module);
     return module;
 }
 
@@ -2060,6 +2458,7 @@ HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR fileName, HANDLE file, DWORD flags)
     SOCKETU_GUARD_RETURN(Real_LoadLibraryExW(fileName, file, flags));
     HMODULE module = Real_LoadLibraryExW(fileName, file, flags);
     TryInstallOpenSslHooks(module);
+    TryInstallScriptRuntimeHooks(module);
     return module;
 }
 
