@@ -1,0 +1,23 @@
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Visual Studio build outputs
+**/x64/
+**/Win32/
+**/Debug/
+**/Release/
+**/*.obj
+**/*.pdb
+**/*.ipdb
+**/*.iobj
+**/*.ilk
+**/*.pch
+**/*.tlog/
+**/*.recipe
+
+# Runtime logs
+*.log
+*.jsonl
