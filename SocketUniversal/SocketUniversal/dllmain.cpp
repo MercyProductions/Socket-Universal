@@ -34,6 +34,10 @@
 #include <unordered_set>
 #include <vector>
 
+#ifndef WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET
+#define WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET 114
+#endif
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "wininet.lib")
@@ -55,16 +59,41 @@ struct RuntimeConfig {
     bool namedPipe = true;
     bool consoleColor = true;
     bool callStack = true;
+    bool scriptFileCapture = true;
+    bool scriptExportScan = true;
+    bool scriptStringScan = true;
+    bool webSocketCapture = true;
+    bool webSocketFrameScan = true;
+    bool graalProbes = false;
     bool loggingEnabled = true;
     int maxDumpBytes = 4096; // Set SOCKETUNIVERSAL_MAX_DUMP_BYTES=0 for no cap.
     int maxCallStackFrames = 8;
+    int maxScriptExportLogs = 256;
+    int maxScriptStringLogs = 128;
+    int maxMappedScriptPreviewBytes = 65536;
+    int maxWebSocketFramesPerBuffer = 16;
+    int maxWebSocketFramePreviewBytes = 65536;
+    int maxGraalBytecodeBytes = 1048576;
     unsigned long long rotateBytes = 10ull * 1024ull * 1024ull;
     int rotateFiles = 5;
     DWORD threadFilter = 0;
     std::string processFilter;
+    std::string graalModuleFilter = "MyGame.dll";
     std::string logPath;
     std::string jsonlPath;
     std::string pipeName = R"(\\.\pipe\SocketUniversal)";
+    uintptr_t graalDecryptScriptRva = 0x5B7454;
+    uintptr_t graalExecScriptRva = 0x7C3894;
+    uintptr_t graalBindBytecodeRva = 0x84FFC0;
+    uintptr_t graalEventCallRva = 0x8132C8;
+    uintptr_t graalFindObjectRva = 0x6614E4;
+    uintptr_t graalFindInTableRva = 0x5C2608;
+    uintptr_t graalExecEventRva = 0x84C254;
+    uintptr_t graalOpCallRva = 0x82E11C;
+    uintptr_t graalLookupFunctionRva = 0x811458;
+    uintptr_t graalResolveVariableRva = 0x826878;
+    uintptr_t graalGlobalContextRva = 0x920630;
+    uintptr_t graalXorKeyRva = 0x91DDEC;
 };
 
 struct HttpHandleInfo {
@@ -74,6 +103,7 @@ struct HttpHandleInfo {
     std::string method;
     std::string path;
     bool secure = false;
+    bool webSocketUpgrade = false;
 };
 
 struct PayloadPreview {
@@ -100,9 +130,29 @@ struct CaptureContext {
 struct OverlappedOperation {
     std::string api;
     std::string endpoint;
+    SOCKET socket = INVALID_SOCKET;
     bool inbound = false;
     std::vector<WSABUF> buffers;
     LPWSAOVERLAPPED_COMPLETION_ROUTINE completionRoutine = nullptr;
+};
+
+struct FileHandleInfo {
+    std::string path;
+    std::string scriptKind;
+    unsigned long long fileSize = 0;
+    unsigned long long totalRead = 0;
+};
+
+struct MappingInfo {
+    std::string path;
+    std::string scriptKind;
+    unsigned long long fileSize = 0;
+};
+
+struct ViewInfo {
+    std::string path;
+    std::string scriptKind;
+    SIZE_T viewSize = 0;
 };
 
 static RuntimeConfig g_Config;
@@ -121,9 +171,27 @@ static std::atomic<bool> g_ShuttingDown{ false };
 
 static std::unordered_map<SOCKET, std::string> g_SocketToHost;
 static std::unordered_map<HINTERNET, HttpHandleInfo> g_HandleInfo;
+static std::unordered_map<HANDLE, FileHandleInfo> g_FileInfo;
+static std::unordered_map<HANDLE, MappingInfo> g_MappingInfo;
+static std::unordered_map<LPCVOID, ViewInfo> g_ViewInfo;
 static std::unordered_map<LPWSAOVERLAPPED, OverlappedOperation> g_OverlappedOps;
+static std::unordered_set<SOCKET> g_WebSocketSockets;
+static std::unordered_set<void*> g_OpenSslWebSocketContexts;
+static std::unordered_set<std::string> g_SchannelWebSocketContexts;
 static std::unordered_set<LPVOID> g_DynamicHookTargets;
+static std::unordered_set<HMODULE> g_ScriptScannedModules;
+static std::unordered_set<HMODULE> g_GraalProbeModules;
 static thread_local int g_HookDepth = 0;
+
+void LogEvent(
+    const char* api,
+    const char* direction,
+    const std::string& endpoint,
+    long long bytes,
+    const std::string& status = {},
+    const std::string& detail = {},
+    const void* payloadData = nullptr,
+    size_t payloadLength = 0);
 
 // ===================================================================
 // Original Function Pointers
@@ -150,6 +218,15 @@ static SOCKET(WINAPI* Real_WSASocketW)(int, int, int, LPWSAPROTOCOL_INFOW, GROUP
 static BOOL(WINAPI* Real_GetOverlappedResult)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL) = nullptr;
 static BOOL(WINAPI* Real_GetQueuedCompletionStatus)(HANDLE, LPDWORD, PULONG_PTR, LPOVERLAPPED*, DWORD) = nullptr;
 static BOOL(WINAPI* Real_GetQueuedCompletionStatusEx)(HANDLE, LPOVERLAPPED_ENTRY, ULONG, PULONG, DWORD, BOOL) = nullptr;
+static HANDLE(WINAPI* Real_CreateFileA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE) = nullptr;
+static HANDLE(WINAPI* Real_CreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE) = nullptr;
+static BOOL(WINAPI* Real_ReadFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED) = nullptr;
+static BOOL(WINAPI* Real_CloseHandle)(HANDLE) = nullptr;
+static HANDLE(WINAPI* Real_CreateFileMappingA)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCSTR) = nullptr;
+static HANDLE(WINAPI* Real_CreateFileMappingW)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR) = nullptr;
+static LPVOID(WINAPI* Real_MapViewOfFile)(HANDLE, DWORD, DWORD, DWORD, SIZE_T) = nullptr;
+static LPVOID(WINAPI* Real_MapViewOfFileEx)(HANDLE, DWORD, DWORD, DWORD, SIZE_T, LPVOID) = nullptr;
+static BOOL(WINAPI* Real_UnmapViewOfFile)(LPCVOID) = nullptr;
 
 // DNS
 static int (WINAPI* Real_getaddrinfo)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*) = nullptr;
@@ -164,6 +241,13 @@ static BOOL(WINAPI* Real_WinHttpReceiveResponse)(HINTERNET, LPVOID) = nullptr;
 static BOOL(WINAPI* Real_WinHttpQueryHeaders)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD) = nullptr;
 static BOOL(WINAPI* Real_WinHttpReadData)(HINTERNET, LPVOID, DWORD, LPDWORD) = nullptr;
 static BOOL(WINAPI* Real_WinHttpWriteData)(HINTERNET, LPCVOID, DWORD, LPDWORD) = nullptr;
+static BOOL(WINAPI* Real_WinHttpSetOption)(HINTERNET, DWORD, LPVOID, DWORD) = nullptr;
+static HINTERNET(WINAPI* Real_WinHttpWebSocketCompleteUpgrade)(HINTERNET, DWORD_PTR) = nullptr;
+static DWORD(WINAPI* Real_WinHttpWebSocketSend)(HINTERNET, WINHTTP_WEB_SOCKET_BUFFER_TYPE, PVOID, DWORD) = nullptr;
+static DWORD(WINAPI* Real_WinHttpWebSocketReceive)(HINTERNET, PVOID, DWORD, DWORD*, WINHTTP_WEB_SOCKET_BUFFER_TYPE*) = nullptr;
+static DWORD(WINAPI* Real_WinHttpWebSocketClose)(HINTERNET, USHORT, PVOID, DWORD) = nullptr;
+static DWORD(WINAPI* Real_WinHttpWebSocketShutdown)(HINTERNET, USHORT, PVOID, DWORD) = nullptr;
+static DWORD(WINAPI* Real_WinHttpWebSocketQueryCloseStatus)(HINTERNET, USHORT*, PVOID, DWORD, DWORD*) = nullptr;
 static BOOL(WINAPI* Real_WinHttpCloseHandle)(HINTERNET) = nullptr;
 
 // WinINet
@@ -194,6 +278,16 @@ static int (*Real_luaL_loadbufferx)(void*, const char*, size_t, const char*, con
 static int (*Real_luaL_loadbuffer)(void*, const char*, size_t, const char*) = nullptr;
 static int (*Real_luaL_loadstring)(void*, const char*) = nullptr;
 static int (*Real_lua_pcallk)(void*, int, int, int, intptr_t, void*) = nullptr;
+static void(__fastcall* Real_GraalDecryptScript)(void*, void*, int, void*, int, void*) = nullptr;
+static void(__fastcall* Real_GraalExecScript)(void*, void*, int, void*, void*) = nullptr;
+static void(__fastcall* Real_GraalBindBytecode)(void*, void*) = nullptr;
+static int64_t(__fastcall* Real_GraalEventCall)(void*, void*, const char*, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t) = nullptr;
+static void* (__fastcall* Real_GraalFindObject)(void*, void*) = nullptr;
+static void* (__fastcall* Real_GraalFindInTable)(void*, int, void*) = nullptr;
+static void* (__fastcall* Real_GraalExecEvent)(void*, void*) = nullptr;
+static int64_t(__fastcall* Real_GraalOpCall)(void*, void*) = nullptr;
+static void* (__fastcall* Real_GraalLookupFunction)(void*, void*) = nullptr;
+static void(__fastcall* Real_GraalResolveVariable)(void*, void*) = nullptr;
 static HMODULE(WINAPI* Real_LoadLibraryA)(LPCSTR) = nullptr;
 static HMODULE(WINAPI* Real_LoadLibraryW)(LPCWSTR) = nullptr;
 static HMODULE(WINAPI* Real_LoadLibraryExA)(LPCSTR, HANDLE, DWORD) = nullptr;
@@ -309,6 +403,29 @@ unsigned long long ParseUllEnv(const char* name, unsigned long long fallback)
     }
 
     return parsed;
+}
+
+uintptr_t ParseAddressEnv(const char* name, uintptr_t fallback)
+{
+    std::string value = Trim(GetEnvString(name));
+    if (value.empty()) {
+        return fallback;
+    }
+
+    int base = 10;
+    const char* start = value.c_str();
+    if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+        base = 16;
+        start += 2;
+    }
+
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(start, &end, base);
+    if (!end || *end != '\0') {
+        return fallback;
+    }
+
+    return static_cast<uintptr_t>(parsed);
 }
 
 DWORD ParseDwordEnv(const char* name, DWORD fallback)
@@ -494,6 +611,91 @@ std::string ModuleNameFromAddress(void* address)
     return name ? name : path;
 }
 
+std::string ModuleNameFromHandle(HMODULE module)
+{
+    if (!module) {
+        return {};
+    }
+
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(module, path, static_cast<DWORD>(sizeof(path)))) {
+        return {};
+    }
+
+    const char* name = PathFindFileNameA(path);
+    return name ? name : path;
+}
+
+template <typename T>
+bool SafeReadValue(const void* address, T& value)
+{
+    if (!address) {
+        return false;
+    }
+
+    __try {
+        value = *reinterpret_cast<const T*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool SafeCopyMemory(const void* address, void* output, size_t size)
+{
+    if (!address || !output || size == 0) {
+        return false;
+    }
+
+    __try {
+        memcpy(output, address, size);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+std::string SafeReadBytesAsString(const void* address, size_t size)
+{
+    if (!address || size == 0 || size > static_cast<size_t>(g_Config.maxGraalBytecodeBytes)) {
+        return {};
+    }
+
+    std::string value(size, '\0');
+    if (!SafeCopyMemory(address, value.data(), size)) {
+        return {};
+    }
+    return value;
+}
+
+std::string SafeReadCString(const char* address, size_t maxLength = 4096)
+{
+    if (!address || maxLength == 0) {
+        return {};
+    }
+
+    std::string value;
+    value.reserve(128);
+    for (size_t i = 0; i < maxLength; ++i) {
+        char ch = 0;
+        if (!SafeReadValue(address + i, ch)) {
+            break;
+        }
+        if (ch == '\0') {
+            break;
+        }
+        if (std::isprint(static_cast<unsigned char>(ch)) || ch == '\t' || ch == '\r' || ch == '\n') {
+            value.push_back(ch);
+        }
+        else {
+            value.push_back('.');
+        }
+    }
+    return value;
+}
+
 bool IsOwnModuleAddress(void* address)
 {
     HMODULE module = nullptr;
@@ -560,6 +762,241 @@ std::string DetectScriptKindFromText(const std::string& value)
     }
 
     return {};
+}
+
+std::string DetectScriptKindFromPath(const std::string& path)
+{
+    std::string lower = Lower(path);
+    if (lower.find(".gsc") != std::string::npos || lower.find(".csc") != std::string::npos ||
+        lower.find("gscbin") != std::string::npos || lower.find("maps/mp/gametypes") != std::string::npos) {
+        return "gsc";
+    }
+
+    if (lower.find(".gs2") != std::string::npos || lower.find("gs2bin") != std::string::npos) {
+        return "gs2";
+    }
+
+    if (lower.find(".lua") != std::string::npos || lower.find(".luac") != std::string::npos) {
+        return "lua";
+    }
+
+    if (lower.find(".nut") != std::string::npos) {
+        return "squirrel";
+    }
+
+    if (lower.find(".as") != std::string::npos || lower.find("angelscript") != std::string::npos) {
+        return "angelscript";
+    }
+
+    return {};
+}
+
+bool IsScriptPath(const std::string& path)
+{
+    return !DetectScriptKindFromPath(path).empty();
+}
+
+bool IsLikelyScriptExportName(const std::string& name)
+{
+    std::string lower = Lower(name);
+    return lower.find("gsc") != std::string::npos ||
+        lower.find("gs2") != std::string::npos ||
+        lower.find("csc") != std::string::npos ||
+        lower.find("scr_") != std::string::npos ||
+        lower.find("script") != std::string::npos ||
+        lower.find("gscr") != std::string::npos ||
+        lower.find("cscr") != std::string::npos ||
+        lower.find("loadscript") != std::string::npos ||
+        lower.find("exec") != std::string::npos ||
+        lower.find("compile") != std::string::npos ||
+        lower.find("parse") != std::string::npos ||
+        lower.find("vm") != std::string::npos ||
+        lower.find("sl_get") != std::string::npos;
+}
+
+bool IsLikelyGameModuleName(const std::string& moduleName)
+{
+    if (moduleName.empty()) {
+        return false;
+    }
+
+    return !IsSystemOrHookModuleName(moduleName) &&
+        Lower(moduleName).find("minhook") == std::string::npos;
+}
+
+bool ShouldProbeGraalModule(HMODULE module)
+{
+    if (!g_Config.graalProbes || !module) {
+        return false;
+    }
+
+    std::string moduleName = ModuleNameFromHandle(module);
+    if (moduleName.empty()) {
+        return false;
+    }
+
+    if (!g_Config.graalModuleFilter.empty()) {
+        return Lower(moduleName).find(Lower(g_Config.graalModuleFilter)) != std::string::npos;
+    }
+
+    return IsLikelyGameModuleName(moduleName);
+}
+
+std::string ReadGraalStringWrapper(void* wrapper)
+{
+    void* stringStruct = nullptr;
+    if (!SafeReadValue(wrapper, stringStruct) || !stringStruct) {
+        return {};
+    }
+
+    int length = 0;
+    if (!SafeReadValue(stringStruct, length) || length <= 0 || length > 4096) {
+        return SafeReadCString(reinterpret_cast<const char*>(stringStruct) + 8);
+    }
+
+    return SafeReadBytesAsString(reinterpret_cast<unsigned char*>(stringStruct) + 8, static_cast<size_t>(length));
+}
+
+std::string ReadGraalEncryptedObjectName(void* object, HMODULE module)
+{
+    if (!object || !module || g_Config.graalXorKeyRva == 0) {
+        return {};
+    }
+
+    void* stringStruct = nullptr;
+    if (!SafeReadValue(reinterpret_cast<unsigned char*>(object) + 32, stringStruct) || !stringStruct) {
+        return {};
+    }
+
+    int length = 0;
+    if (!SafeReadValue(stringStruct, length) || length <= 0 || length > 4096) {
+        return {};
+    }
+
+    unsigned char key[3] = {};
+    if (!SafeCopyMemory(reinterpret_cast<unsigned char*>(module) + g_Config.graalXorKeyRva, key, sizeof(key))) {
+        return {};
+    }
+
+    std::string encrypted = SafeReadBytesAsString(reinterpret_cast<unsigned char*>(stringStruct) + 8, static_cast<size_t>(length));
+    if (encrypted.empty()) {
+        return {};
+    }
+
+    std::string decrypted;
+    decrypted.reserve(encrypted.size());
+    for (size_t i = 0; i < encrypted.size(); ++i) {
+        decrypted.push_back(static_cast<char>(static_cast<unsigned char>(encrypted[i]) ^ key[i % 3]));
+    }
+    return decrypted;
+}
+
+bool ReadGraalBytecodeHeader(void* bytecode, uint32_t& realSize, uint32_t& version, uint32_t& flags)
+{
+    realSize = 0;
+    version = 0;
+    flags = 0;
+    if (!bytecode) {
+        return false;
+    }
+
+    if (!SafeReadValue(bytecode, realSize)) {
+        return false;
+    }
+    SafeReadValue(reinterpret_cast<unsigned char*>(bytecode) + 4, version);
+    SafeReadValue(reinterpret_cast<unsigned char*>(bytecode) + 8, flags);
+    return realSize > 0 && realSize <= static_cast<uint32_t>(g_Config.maxGraalBytecodeBytes);
+}
+
+void LogGraalBytecode(const char* api, void* bytecode, const std::string& name, const std::string& detail)
+{
+    uint32_t realSize = 0;
+    uint32_t version = 0;
+    uint32_t flags = 0;
+    bool valid = ReadGraalBytecodeHeader(bytecode, realSize, version, flags);
+    std::string endpoint = name.empty() ? "graal-runtime" : ("graal-runtime/" + name);
+    std::string status = valid ? "gs2-bytecode" : "gs2-bytecode-invalid";
+    std::string fullDetail = FormatString(
+        "%s ptr=%p real_size=%u version=%u flags=0x%08X",
+        detail.c_str(),
+        bytecode,
+        realSize,
+        version,
+        flags);
+
+    LogEvent(
+        api ? api : "GraalBytecode",
+        "script",
+        endpoint,
+        valid ? realSize : 0,
+        status,
+        fullDetail,
+        valid ? bytecode : nullptr,
+        valid ? realSize : 0);
+}
+
+void ScanGraalScriptManager(HMODULE module, const char* reason)
+{
+    if (!g_Config.graalProbes || !module || g_Config.graalGlobalContextRva == 0) {
+        return;
+    }
+
+    void* context = nullptr;
+    if (!SafeReadValue(reinterpret_cast<unsigned char*>(module) + g_Config.graalGlobalContextRva, context) || !context) {
+        LogEvent("GraalScriptManager", "script-manager", ModuleNameFromHandle(module), 0, "missing-context", FormatString("reason=%s global_rva=%s", reason ? reason : "?", HexAddress(g_Config.graalGlobalContextRva).c_str()));
+        return;
+    }
+
+    void* scriptManager = nullptr;
+    if (!SafeReadValue(reinterpret_cast<unsigned char*>(context) + 0xB30, scriptManager) || !scriptManager) {
+        LogEvent("GraalScriptManager", "script-manager", ModuleNameFromHandle(module), 0, "missing-manager", FormatString("reason=%s context=%p offset=0xB30", reason ? reason : "?", context));
+        return;
+    }
+
+    void* listStruct = nullptr;
+    int count = 0;
+    void* dataArray = nullptr;
+    SafeReadValue(reinterpret_cast<unsigned char*>(scriptManager) + 0x38, listStruct);
+    if (listStruct) {
+        SafeReadValue(reinterpret_cast<unsigned char*>(listStruct) + 12, count);
+        SafeReadValue(reinterpret_cast<unsigned char*>(listStruct) + 16, dataArray);
+    }
+
+    LogEvent(
+        "GraalScriptManager",
+        "script-manager",
+        ModuleNameFromHandle(module),
+        count,
+        "gs2",
+        FormatString("reason=%s module_base=%p context=%p manager=%p list=%p array=%p", reason ? reason : "?", module, context, scriptManager, listStruct, dataArray));
+
+    if (count <= 0 || count > 4096 || !dataArray) {
+        return;
+    }
+
+    int maxToLog = count < 64 ? count : 64;
+    for (int i = 0; i < maxToLog; ++i) {
+        void* scriptObject = nullptr;
+        if (!SafeReadValue(reinterpret_cast<unsigned char*>(dataArray) + i * sizeof(void*), scriptObject) || !scriptObject) {
+            continue;
+        }
+
+        void* vtable = nullptr;
+        void* vtable16 = nullptr;
+        SafeReadValue(scriptObject, vtable);
+        if (vtable) {
+            SafeReadValue(reinterpret_cast<unsigned char*>(vtable) + 128, vtable16);
+        }
+
+        std::string objectName = ReadGraalEncryptedObjectName(scriptObject, module);
+        LogEvent(
+            "GraalScriptManager",
+            "script-object",
+            objectName.empty() ? ModuleNameFromHandle(module) : objectName,
+            0,
+            "gs2",
+            FormatString("index=%d object=%p vtable=%p vtable16=%s", i, scriptObject, vtable, ModuleSiteFromAddress(vtable16).c_str()));
+    }
 }
 
 std::string DetectScriptKindFromStack(const std::vector<std::string>& frames)
@@ -932,15 +1369,44 @@ void LoadConfig()
     g_Config.namedPipe = ParseBoolEnv("SOCKETUNIVERSAL_PIPE", true);
     g_Config.consoleColor = ParseBoolEnv("SOCKETUNIVERSAL_COLOR", true);
     g_Config.callStack = ParseBoolEnv("SOCKETUNIVERSAL_CALLSTACK", true);
+    g_Config.scriptFileCapture = ParseBoolEnv("SOCKETUNIVERSAL_SCRIPT_FILE_CAPTURE", true);
+    g_Config.scriptExportScan = ParseBoolEnv("SOCKETUNIVERSAL_SCRIPT_EXPORT_SCAN", true);
+    g_Config.scriptStringScan = ParseBoolEnv("SOCKETUNIVERSAL_SCRIPT_STRING_SCAN", true);
+    g_Config.webSocketCapture = ParseBoolEnv("SOCKETUNIVERSAL_WEBSOCKET_CAPTURE", true);
+    g_Config.webSocketFrameScan = ParseBoolEnv("SOCKETUNIVERSAL_WEBSOCKET_FRAME_SCAN", true);
+    g_Config.graalProbes = ParseBoolEnv("SOCKETUNIVERSAL_GRAAL_PROBES", false);
     g_Config.maxDumpBytes = ParseIntEnv("SOCKETUNIVERSAL_MAX_DUMP_BYTES", 4096);
     g_Config.maxCallStackFrames = ParseIntEnv("SOCKETUNIVERSAL_CALLSTACK_FRAMES", 8);
+    g_Config.maxScriptExportLogs = ParseIntEnv("SOCKETUNIVERSAL_SCRIPT_EXPORT_LIMIT", 256);
+    g_Config.maxScriptStringLogs = ParseIntEnv("SOCKETUNIVERSAL_SCRIPT_STRING_LIMIT", 128);
+    g_Config.maxMappedScriptPreviewBytes = ParseIntEnv("SOCKETUNIVERSAL_SCRIPT_MAP_PREVIEW_BYTES", 65536);
+    g_Config.maxWebSocketFramesPerBuffer = ParseIntEnv("SOCKETUNIVERSAL_WEBSOCKET_FRAME_LIMIT", 16);
+    g_Config.maxWebSocketFramePreviewBytes = ParseIntEnv("SOCKETUNIVERSAL_WEBSOCKET_PREVIEW_BYTES", 65536);
+    g_Config.maxGraalBytecodeBytes = ParseIntEnv("SOCKETUNIVERSAL_GRAAL_MAX_BYTECODE_BYTES", 1048576);
     g_Config.rotateBytes = ParseUllEnv("SOCKETUNIVERSAL_ROTATE_BYTES", 10ull * 1024ull * 1024ull);
     g_Config.rotateFiles = ParseIntEnv("SOCKETUNIVERSAL_ROTATE_FILES", 5);
     g_Config.threadFilter = ParseDwordEnv("SOCKETUNIVERSAL_THREAD_FILTER", 0);
     g_Config.processFilter = Trim(GetEnvString("SOCKETUNIVERSAL_PROCESS_FILTER"));
+    g_Config.graalModuleFilter = Trim(GetEnvString("SOCKETUNIVERSAL_GRAAL_MODULE"));
     g_Config.logPath = Trim(GetEnvString("SOCKETUNIVERSAL_LOG_FILE"));
     g_Config.jsonlPath = Trim(GetEnvString("SOCKETUNIVERSAL_JSONL_FILE"));
     g_Config.pipeName = Trim(GetEnvString("SOCKETUNIVERSAL_PIPE_NAME"));
+    g_Config.graalDecryptScriptRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_DECRYPT_RVA", g_Config.graalDecryptScriptRva);
+    g_Config.graalExecScriptRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_EXEC_RVA", g_Config.graalExecScriptRva);
+    g_Config.graalBindBytecodeRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_BIND_RVA", g_Config.graalBindBytecodeRva);
+    g_Config.graalEventCallRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_EVENT_CALL_RVA", g_Config.graalEventCallRva);
+    g_Config.graalFindObjectRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_FIND_OBJECT_RVA", g_Config.graalFindObjectRva);
+    g_Config.graalFindInTableRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_FIND_TABLE_RVA", g_Config.graalFindInTableRva);
+    g_Config.graalExecEventRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_EXEC_EVENT_RVA", g_Config.graalExecEventRva);
+    g_Config.graalOpCallRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_OP_CALL_RVA", g_Config.graalOpCallRva);
+    g_Config.graalLookupFunctionRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_LOOKUP_RVA", g_Config.graalLookupFunctionRva);
+    g_Config.graalResolveVariableRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_RESOLVE_RVA", g_Config.graalResolveVariableRva);
+    g_Config.graalGlobalContextRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_CONTEXT_RVA", g_Config.graalGlobalContextRva);
+    g_Config.graalXorKeyRva = ParseAddressEnv("SOCKETUNIVERSAL_GRAAL_XOR_KEY_RVA", g_Config.graalXorKeyRva);
+
+    if (g_Config.graalModuleFilter.empty()) {
+        g_Config.graalModuleFilter = "MyGame.dll";
+    }
 
     if (g_Config.logPath.empty()) {
         g_Config.logPath = JoinPath(moduleDir, "SocketUniversal.log");
@@ -1293,6 +1759,467 @@ std::string EndpointFromHttpInfo(const HttpHandleInfo& info)
     return endpoint;
 }
 
+bool TextContainsWebSocketUpgrade(const std::string& value)
+{
+    if (value.empty()) {
+        return false;
+    }
+
+    std::string lower = Lower(value);
+    return lower.find("upgrade: websocket") != std::string::npos ||
+        lower.find("sec-websocket-key:") != std::string::npos ||
+        lower.find("sec-websocket-accept:") != std::string::npos;
+}
+
+bool PayloadLooksLikeWebSocketHandshake(const void* data, size_t length)
+{
+    if (!data || length == 0) {
+        return false;
+    }
+
+    size_t scanLength = length < 16384 ? length : 16384;
+    std::string text(static_cast<const char*>(data), scanLength);
+    return TextContainsWebSocketUpgrade(text);
+}
+
+void MarkHttpHandleWebSocketUpgrade(HINTERNET handle)
+{
+    if (!handle) {
+        return;
+    }
+
+    HttpHandleInfo info = GetHandleInfo(handle);
+    info.webSocketUpgrade = true;
+    if (info.method.empty()) {
+        info.method = "GET";
+    }
+    TrackHandle(handle, info);
+}
+
+void MarkSocketWebSocket(SOCKET socket)
+{
+    if (socket == INVALID_SOCKET) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    g_WebSocketSockets.insert(socket);
+}
+
+bool IsTrackedWebSocketSocket(SOCKET socket)
+{
+    if (socket == INVALID_SOCKET) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    return g_WebSocketSockets.find(socket) != g_WebSocketSockets.end();
+}
+
+void RemoveWebSocketSocket(SOCKET socket)
+{
+    if (socket == INVALID_SOCKET) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    g_WebSocketSockets.erase(socket);
+}
+
+void MarkOpenSslWebSocketContext(void* ssl)
+{
+    if (!ssl) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    g_OpenSslWebSocketContexts.insert(ssl);
+}
+
+bool IsTrackedOpenSslWebSocketContext(void* ssl)
+{
+    if (!ssl) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    return g_OpenSslWebSocketContexts.find(ssl) != g_OpenSslWebSocketContexts.end();
+}
+
+std::string SchannelContextKey(PCtxtHandle context)
+{
+    if (!context) {
+        return {};
+    }
+
+    return FormatString(
+        "%llX:%llX",
+        static_cast<unsigned long long>(context->dwLower),
+        static_cast<unsigned long long>(context->dwUpper));
+}
+
+void MarkSchannelWebSocketContext(PCtxtHandle context)
+{
+    std::string key = SchannelContextKey(context);
+    if (key.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    g_SchannelWebSocketContexts.insert(key);
+}
+
+bool IsTrackedSchannelWebSocketContext(PCtxtHandle context)
+{
+    std::string key = SchannelContextKey(context);
+    if (key.empty()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    return g_SchannelWebSocketContexts.find(key) != g_SchannelWebSocketContexts.end();
+}
+
+const char* WebSocketBufferTypeName(WINHTTP_WEB_SOCKET_BUFFER_TYPE type)
+{
+    switch (type) {
+    case WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE:
+        return "binary-message";
+    case WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE:
+        return "binary-fragment";
+    case WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE:
+        return "text-message";
+    case WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE:
+        return "text-fragment";
+    case WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE:
+        return "close";
+    default:
+        return "unknown";
+    }
+}
+
+bool WebSocketBufferTypeHasPayload(WINHTTP_WEB_SOCKET_BUFFER_TYPE type)
+{
+    return type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
+        type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE ||
+        type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
+        type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
+        type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE;
+}
+
+const char* WebSocketOpcodeName(unsigned char opcode)
+{
+    switch (opcode) {
+    case 0x0:
+        return "continuation";
+    case 0x1:
+        return "text";
+    case 0x2:
+        return "binary";
+    case 0x8:
+        return "close";
+    case 0x9:
+        return "ping";
+    case 0xA:
+        return "pong";
+    default:
+        return "unknown";
+    }
+}
+
+bool IsValidWebSocketOpcode(unsigned char opcode)
+{
+    return opcode == 0x0 || opcode == 0x1 || opcode == 0x2 ||
+        opcode == 0x8 || opcode == 0x9 || opcode == 0xA;
+}
+
+bool DirectionIsOutbound(const char* direction)
+{
+    std::string lower = Lower(direction ? direction : "");
+    return lower.find("out") != std::string::npos ||
+        lower.find("write") != std::string::npos;
+}
+
+const char* WebSocketDirection(const char* direction)
+{
+    return DirectionIsOutbound(direction) ? "websocket-out" : "websocket-in";
+}
+
+struct WebSocketFrameInfo {
+    bool fin = false;
+    bool masked = false;
+    unsigned char opcode = 0;
+    unsigned long long payloadLength = 0;
+    size_t headerLength = 0;
+    size_t frameLength = 0;
+    const unsigned char* payload = nullptr;
+    unsigned char maskKey[4] = {};
+};
+
+bool TryParseWebSocketFrame(const unsigned char* data, size_t length, WebSocketFrameInfo& frame)
+{
+    frame = WebSocketFrameInfo{};
+    if (!data || length < 2) {
+        return false;
+    }
+
+    unsigned char first = data[0];
+    unsigned char second = data[1];
+    if ((first & 0x70) != 0) {
+        return false;
+    }
+
+    frame.fin = (first & 0x80) != 0;
+    frame.opcode = first & 0x0F;
+    if (!IsValidWebSocketOpcode(frame.opcode)) {
+        return false;
+    }
+
+    frame.masked = (second & 0x80) != 0;
+    unsigned long long payloadLength = second & 0x7F;
+    size_t offset = 2;
+
+    if (payloadLength == 126) {
+        if (length < offset + 2) {
+            return false;
+        }
+        payloadLength = (static_cast<unsigned long long>(data[offset]) << 8) |
+            static_cast<unsigned long long>(data[offset + 1]);
+        offset += 2;
+    }
+    else if (payloadLength == 127) {
+        if (length < offset + 8 || (data[offset] & 0x80) != 0) {
+            return false;
+        }
+
+        payloadLength = 0;
+        for (int i = 0; i < 8; ++i) {
+            payloadLength = (payloadLength << 8) | static_cast<unsigned long long>(data[offset + i]);
+        }
+        offset += 8;
+    }
+
+    if (frame.opcode >= 0x8 && (!frame.fin || payloadLength > 125)) {
+        return false;
+    }
+
+    if (frame.masked) {
+        if (length < offset + 4) {
+            return false;
+        }
+        memcpy(frame.maskKey, data + offset, sizeof(frame.maskKey));
+        offset += 4;
+    }
+
+    if (payloadLength > static_cast<unsigned long long>(length - offset)) {
+        return false;
+    }
+
+    frame.payloadLength = payloadLength;
+    frame.headerLength = offset;
+    frame.frameLength = offset + static_cast<size_t>(payloadLength);
+    frame.payload = data + offset;
+    return true;
+}
+
+void LogWebSocketApiMessage(
+    const char* api,
+    const char* direction,
+    const std::string& endpoint,
+    WINHTTP_WEB_SOCKET_BUFFER_TYPE bufferType,
+    DWORD result,
+    const void* payloadData,
+    size_t payloadLength,
+    const std::string& extraDetail = {})
+{
+    if (!g_Config.webSocketCapture) {
+        return;
+    }
+
+    std::string status = result == ERROR_SUCCESS ? WebSocketBufferTypeName(bufferType) : FormatString("error=%lu", result);
+    std::string detail = FormatString("type=%s", WebSocketBufferTypeName(bufferType));
+    if (!extraDetail.empty()) {
+        detail += " " + extraDetail;
+    }
+
+    size_t previewLength = payloadLength;
+    if (g_Config.maxWebSocketFramePreviewBytes > 0 && previewLength > static_cast<size_t>(g_Config.maxWebSocketFramePreviewBytes)) {
+        previewLength = static_cast<size_t>(g_Config.maxWebSocketFramePreviewBytes);
+        detail += FormatString(" payload_preview_bytes=%zu", previewLength);
+    }
+
+    LogEvent(
+        api,
+        direction,
+        endpoint,
+        static_cast<long long>(payloadLength),
+        status,
+        detail,
+        WebSocketBufferTypeHasPayload(bufferType) && payloadData && previewLength > 0 ? payloadData : nullptr,
+        WebSocketBufferTypeHasPayload(bufferType) && payloadData && previewLength > 0 ? previewLength : 0);
+}
+
+bool LogWebSocketWireFrames(
+    const char* api,
+    const char* direction,
+    const std::string& endpoint,
+    const void* data,
+    size_t length)
+{
+    if (!g_Config.webSocketCapture || !g_Config.webSocketFrameScan || !data || length < 2) {
+        return false;
+    }
+
+    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+    size_t offset = 0;
+    int logged = 0;
+    int frameLimit = g_Config.maxWebSocketFramesPerBuffer > 0 ? g_Config.maxWebSocketFramesPerBuffer : 16;
+
+    while (offset < length && logged < frameLimit) {
+        WebSocketFrameInfo frame;
+        if (!TryParseWebSocketFrame(bytes + offset, length - offset, frame) || frame.frameLength == 0) {
+            break;
+        }
+
+        std::string detail = FormatString(
+            "opcode=%s(0x%X) fin=%s masked=%s header=%zu offset=%zu",
+            WebSocketOpcodeName(frame.opcode),
+            static_cast<unsigned>(frame.opcode),
+            frame.fin ? "yes" : "no",
+            frame.masked ? "yes" : "no",
+            frame.headerLength,
+            offset);
+
+        size_t previewLength = static_cast<size_t>(frame.payloadLength);
+        if (g_Config.maxWebSocketFramePreviewBytes > 0 && previewLength > static_cast<size_t>(g_Config.maxWebSocketFramePreviewBytes)) {
+            previewLength = static_cast<size_t>(g_Config.maxWebSocketFramePreviewBytes);
+            detail += FormatString(" payload_preview_bytes=%zu", previewLength);
+        }
+
+        if (frame.masked && previewLength > 0) {
+            std::string unmasked(previewLength, '\0');
+            for (size_t i = 0; i < previewLength; ++i) {
+                unmasked[i] = static_cast<char>(frame.payload[i] ^ frame.maskKey[i % 4]);
+            }
+            LogEvent(api, WebSocketDirection(direction), endpoint, static_cast<long long>(frame.payloadLength), WebSocketOpcodeName(frame.opcode), detail, unmasked.data(), unmasked.size());
+        }
+        else {
+            LogEvent(api, WebSocketDirection(direction), endpoint, static_cast<long long>(frame.payloadLength), WebSocketOpcodeName(frame.opcode), detail, frame.payload, previewLength);
+        }
+
+        offset += frame.frameLength;
+        logged++;
+    }
+
+    if (logged == frameLimit && offset < length) {
+        LogEvent(api, WebSocketDirection(direction), endpoint, static_cast<long long>(length - offset), "frame-limit", FormatString("remaining=%zu limit=%d", length - offset, frameLimit));
+    }
+
+    return logged > 0;
+}
+
+void ObserveSocketWebSocketPayload(
+    SOCKET socket,
+    const char* api,
+    const char* direction,
+    const std::string& endpoint,
+    const void* data,
+    size_t length)
+{
+    if (!g_Config.webSocketCapture || !data || length == 0) {
+        return;
+    }
+
+    if (PayloadLooksLikeWebSocketHandshake(data, length)) {
+        MarkSocketWebSocket(socket);
+        LogEvent(api, "websocket-handshake", endpoint, static_cast<long long>(length), DirectionIsOutbound(direction) ? "request" : "response", {}, data, length);
+        return;
+    }
+
+    if (IsTrackedWebSocketSocket(socket)) {
+        LogWebSocketWireFrames(api, direction, endpoint, data, length);
+    }
+}
+
+void ObserveSocketWebSocketBuffers(
+    SOCKET socket,
+    const char* api,
+    const char* direction,
+    const std::string& endpoint,
+    LPWSABUF buffers,
+    DWORD bufferCount,
+    size_t byteLimit)
+{
+    if (!buffers || bufferCount == 0 || byteLimit == 0) {
+        return;
+    }
+
+    size_t remaining = byteLimit;
+    bool limited = byteLimit != static_cast<size_t>(-1);
+    for (DWORD i = 0; i < bufferCount; ++i) {
+        if (!buffers[i].buf || buffers[i].len == 0) {
+            continue;
+        }
+
+        size_t chunk = buffers[i].len;
+        if (limited) {
+            if (remaining == 0) {
+                break;
+            }
+            chunk = chunk < remaining ? chunk : remaining;
+            remaining -= chunk;
+        }
+
+        ObserveSocketWebSocketPayload(socket, api, direction, endpoint, buffers[i].buf, chunk);
+    }
+}
+
+void ObserveOpenSslWebSocketPayload(
+    void* ssl,
+    const char* api,
+    const char* direction,
+    const std::string& endpoint,
+    const void* data,
+    size_t length)
+{
+    if (!g_Config.webSocketCapture || !ssl || !data || length == 0) {
+        return;
+    }
+
+    if (PayloadLooksLikeWebSocketHandshake(data, length)) {
+        MarkOpenSslWebSocketContext(ssl);
+        LogEvent(api, "websocket-handshake", endpoint, static_cast<long long>(length), DirectionIsOutbound(direction) ? "request" : "response", "openssl", data, length);
+        return;
+    }
+
+    if (IsTrackedOpenSslWebSocketContext(ssl)) {
+        LogWebSocketWireFrames(api, direction, endpoint, data, length);
+    }
+}
+
+void ObserveSchannelWebSocketPayload(
+    PCtxtHandle context,
+    const char* api,
+    const char* direction,
+    const std::string& endpoint,
+    const void* data,
+    size_t length)
+{
+    if (!g_Config.webSocketCapture || !context || !data || length == 0) {
+        return;
+    }
+
+    if (PayloadLooksLikeWebSocketHandshake(data, length)) {
+        MarkSchannelWebSocketContext(context);
+        LogEvent(api, "websocket-handshake", endpoint, static_cast<long long>(length), DirectionIsOutbound(direction) ? "request" : "response", "schannel", data, length);
+        return;
+    }
+
+    if (IsTrackedSchannelWebSocketContext(context)) {
+        LogWebSocketWireFrames(api, direction, endpoint, data, length);
+    }
+}
+
 // ===================================================================
 // Structured event logging
 // ===================================================================
@@ -1352,10 +2279,10 @@ void LogEvent(
     const char* direction,
     const std::string& endpoint,
     long long bytes,
-    const std::string& status = {},
-    const std::string& detail = {},
-    const void* payloadData = nullptr,
-    size_t payloadLength = 0)
+    const std::string& status,
+    const std::string& detail,
+    const void* payloadData,
+    size_t payloadLength)
 {
     if (!ShouldLog()) {
         return;
@@ -1461,8 +2388,172 @@ void LogBuffers(const char* api, const char* direction, const std::string& endpo
     }
 }
 
+unsigned long long FileSizeFromHandle(HANDLE handle)
+{
+    LARGE_INTEGER size = {};
+    if (handle != INVALID_HANDLE_VALUE && GetFileSizeEx(handle, &size)) {
+        return static_cast<unsigned long long>(size.QuadPart);
+    }
+    return 0;
+}
+
+std::string FinalPathFromHandle(HANDLE handle)
+{
+    if (handle == INVALID_HANDLE_VALUE || !handle) {
+        return {};
+    }
+
+    std::vector<char> path(MAX_PATH * 4);
+    DWORD copied = GetFinalPathNameByHandleA(handle, path.data(), static_cast<DWORD>(path.size()), FILE_NAME_NORMALIZED);
+    if (copied == 0 || copied >= path.size()) {
+        return {};
+    }
+
+    std::string value(path.data(), copied);
+    const std::string devicePrefix = R"(\\?\)";
+    if (value.rfind(devicePrefix, 0) == 0) {
+        value.erase(0, devicePrefix.size());
+    }
+    return value;
+}
+
+void TrackScriptFileHandle(HANDLE handle, const std::string& requestedPath, const char* api, DWORD desiredAccess, DWORD creationDisposition)
+{
+    if (!g_Config.scriptFileCapture || handle == INVALID_HANDLE_VALUE || !handle) {
+        return;
+    }
+
+    std::string path = requestedPath.empty() ? FinalPathFromHandle(handle) : requestedPath;
+    std::string scriptKind = DetectScriptKindFromPath(path);
+    if (scriptKind.empty()) {
+        return;
+    }
+
+    FileHandleInfo info;
+    info.path = path;
+    info.scriptKind = scriptKind;
+    info.fileSize = FileSizeFromHandle(handle);
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        g_FileInfo[handle] = info;
+    }
+
+    LogEvent(
+        api ? api : "CreateFile",
+        "script-file-open",
+        path,
+        static_cast<long long>(info.fileSize),
+        scriptKind,
+        FormatString("desired_access=0x%08lX disposition=%lu handle=%p", desiredAccess, creationDisposition, handle));
+}
+
+bool GetTrackedFile(HANDLE handle, FileHandleInfo& info)
+{
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    auto it = g_FileInfo.find(handle);
+    if (it == g_FileInfo.end()) {
+        return false;
+    }
+    info = it->second;
+    return true;
+}
+
+void UpdateTrackedFileRead(HANDLE handle, DWORD bytesRead)
+{
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    auto it = g_FileInfo.find(handle);
+    if (it != g_FileInfo.end()) {
+        it->second.totalRead += bytesRead;
+    }
+}
+
+void RemoveTrackedHandle(HANDLE handle)
+{
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    g_FileInfo.erase(handle);
+    g_MappingInfo.erase(handle);
+}
+
+void TrackScriptMapping(HANDLE mapping, HANDLE file, const char* api, DWORD protect, const std::string& mappingName)
+{
+    if (!g_Config.scriptFileCapture || !mapping || mapping == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    FileHandleInfo fileInfo;
+    if (!GetTrackedFile(file, fileInfo)) {
+        return;
+    }
+
+    MappingInfo mappingInfo;
+    mappingInfo.path = fileInfo.path;
+    mappingInfo.scriptKind = fileInfo.scriptKind;
+    mappingInfo.fileSize = fileInfo.fileSize;
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        g_MappingInfo[mapping] = mappingInfo;
+    }
+
+    LogEvent(
+        api ? api : "CreateFileMapping",
+        "script-map-create",
+        mappingInfo.path,
+        static_cast<long long>(mappingInfo.fileSize),
+        mappingInfo.scriptKind,
+        FormatString("protect=0x%08lX mapping=%p name=%s", protect, mapping, mappingName.empty() ? "?" : mappingName.c_str()));
+}
+
+bool GetTrackedMapping(HANDLE mapping, MappingInfo& info)
+{
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    auto it = g_MappingInfo.find(mapping);
+    if (it == g_MappingInfo.end()) {
+        return false;
+    }
+    info = it->second;
+    return true;
+}
+
+void TrackMappedView(LPCVOID view, const MappingInfo& mapping, SIZE_T requestedBytes)
+{
+    if (!view) {
+        return;
+    }
+
+    ViewInfo viewInfo;
+    viewInfo.path = mapping.path;
+    viewInfo.scriptKind = mapping.scriptKind;
+    viewInfo.viewSize = requestedBytes != 0 ? requestedBytes : static_cast<SIZE_T>(mapping.fileSize);
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        g_ViewInfo[view] = viewInfo;
+    }
+
+    SIZE_T previewBytes = viewInfo.viewSize;
+    if (g_Config.maxMappedScriptPreviewBytes > 0 && previewBytes > static_cast<SIZE_T>(g_Config.maxMappedScriptPreviewBytes)) {
+        previewBytes = static_cast<SIZE_T>(g_Config.maxMappedScriptPreviewBytes);
+    }
+
+    LogEvent(
+        "MapViewOfFile",
+        "script-map-view",
+        mapping.path,
+        static_cast<long long>(viewInfo.viewSize),
+        mapping.scriptKind,
+        FormatString("view=%p preview=%zu", view, previewBytes),
+        view,
+        previewBytes);
+}
+
+void RemoveMappedView(LPCVOID view)
+{
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    g_ViewInfo.erase(view);
+}
+
 void TrackOverlappedOperation(
     LPWSAOVERLAPPED overlapped,
+    SOCKET socket,
     const char* api,
     const std::string& endpoint,
     bool inbound,
@@ -1477,6 +2568,7 @@ void TrackOverlappedOperation(
     OverlappedOperation operation;
     operation.api = api ? api : "?";
     operation.endpoint = endpoint;
+    operation.socket = socket;
     operation.inbound = inbound;
     operation.completionRoutine = completionRoutine;
     operation.buffers.assign(buffers, buffers + bufferCount);
@@ -1538,6 +2630,7 @@ void LogCompletedOverlapped(const OverlappedOperation& operation, DWORD bytesTra
         DWORD chunk = buffer.len < remaining ? buffer.len : remaining;
         if (buffer.buf && chunk > 0) {
             LogEvent(operation.api.c_str(), "async-in", operation.endpoint, chunk, "buffer", FormatString("index=%zu", i), buffer.buf, chunk);
+            ObserveSocketWebSocketPayload(operation.socket, operation.api.c_str(), "async-in", operation.endpoint, buffer.buf, chunk);
         }
         remaining -= chunk;
     }
@@ -1555,6 +2648,160 @@ void CALLBACK Hook_WSACompletionRoutine(DWORD error, DWORD bytesTransferred, LPW
     if (original) {
         original(error, bytesTransferred, overlapped, flags);
     }
+}
+
+// ===================================================================
+// Hook Functions - Script File / Mapping Capture
+// ===================================================================
+
+HANDLE WINAPI Hook_CreateFileA(LPCSTR fileName, DWORD desiredAccess, DWORD shareMode, LPSECURITY_ATTRIBUTES securityAttributes, DWORD creationDisposition, DWORD flagsAndAttributes, HANDLE templateFile)
+{
+    SOCKETU_GUARD_RETURN(Real_CreateFileA(fileName, desiredAccess, shareMode, securityAttributes, creationDisposition, flagsAndAttributes, templateFile));
+    HANDLE handle = Real_CreateFileA(fileName, desiredAccess, shareMode, securityAttributes, creationDisposition, flagsAndAttributes, templateFile);
+    TrackScriptFileHandle(handle, fileName ? fileName : "", "CreateFileA", desiredAccess, creationDisposition);
+    return handle;
+}
+
+HANDLE WINAPI Hook_CreateFileW(LPCWSTR fileName, DWORD desiredAccess, DWORD shareMode, LPSECURITY_ATTRIBUTES securityAttributes, DWORD creationDisposition, DWORD flagsAndAttributes, HANDLE templateFile)
+{
+    SOCKETU_GUARD_RETURN(Real_CreateFileW(fileName, desiredAccess, shareMode, securityAttributes, creationDisposition, flagsAndAttributes, templateFile));
+    HANDLE handle = Real_CreateFileW(fileName, desiredAccess, shareMode, securityAttributes, creationDisposition, flagsAndAttributes, templateFile);
+    TrackScriptFileHandle(handle, WideToUtf8(fileName), "CreateFileW", desiredAccess, creationDisposition);
+    return handle;
+}
+
+BOOL WINAPI Hook_ReadFile(HANDLE file, LPVOID buffer, DWORD bytesToRead, LPDWORD bytesRead, LPOVERLAPPED overlapped)
+{
+    SOCKETU_GUARD_RETURN(Real_ReadFile(file, buffer, bytesToRead, bytesRead, overlapped));
+    FileHandleInfo info;
+    bool tracked = GetTrackedFile(file, info);
+    BOOL result = Real_ReadFile(file, buffer, bytesToRead, bytesRead, overlapped);
+    DWORD actual = bytesRead ? *bytesRead : 0;
+
+    if (tracked) {
+        unsigned long long offset = info.totalRead;
+        if (overlapped) {
+            ULARGE_INTEGER overlappedOffset = {};
+            overlappedOffset.LowPart = overlapped->Offset;
+            overlappedOffset.HighPart = overlapped->OffsetHigh;
+            offset = overlappedOffset.QuadPart;
+        }
+
+        if (result && actual > 0) {
+            LogEvent(
+                "ReadFile",
+                "script-file-read",
+                info.path,
+                actual,
+                info.scriptKind,
+                FormatString("offset=%llu requested=%lu overlapped=%s", offset, bytesToRead, overlapped ? "yes" : "no"),
+                buffer,
+                actual);
+            if (!overlapped) {
+                UpdateTrackedFileRead(file, actual);
+            }
+        }
+        else {
+            LogEvent(
+                "ReadFile",
+                "script-file-read",
+                info.path,
+                actual,
+                result ? info.scriptKind : FormatString("failed=%lu", GetLastError()),
+                FormatString("offset=%llu requested=%lu overlapped=%s", offset, bytesToRead, overlapped ? "yes" : "no"));
+        }
+    }
+
+    return result;
+}
+
+HANDLE WINAPI Hook_CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES attributes, DWORD protect, DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
+{
+    SOCKETU_GUARD_RETURN(Real_CreateFileMappingA(file, attributes, protect, maxSizeHigh, maxSizeLow, name));
+    HANDLE mapping = Real_CreateFileMappingA(file, attributes, protect, maxSizeHigh, maxSizeLow, name);
+    TrackScriptMapping(mapping, file, "CreateFileMappingA", protect, name ? name : "");
+    return mapping;
+}
+
+HANDLE WINAPI Hook_CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES attributes, DWORD protect, DWORD maxSizeHigh, DWORD maxSizeLow, LPCWSTR name)
+{
+    SOCKETU_GUARD_RETURN(Real_CreateFileMappingW(file, attributes, protect, maxSizeHigh, maxSizeLow, name));
+    HANDLE mapping = Real_CreateFileMappingW(file, attributes, protect, maxSizeHigh, maxSizeLow, name);
+    TrackScriptMapping(mapping, file, "CreateFileMappingW", protect, WideToUtf8(name));
+    return mapping;
+}
+
+LPVOID WINAPI Hook_MapViewOfFile(HANDLE mapping, DWORD desiredAccess, DWORD fileOffsetHigh, DWORD fileOffsetLow, SIZE_T bytesToMap)
+{
+    SOCKETU_GUARD_RETURN(Real_MapViewOfFile(mapping, desiredAccess, fileOffsetHigh, fileOffsetLow, bytesToMap));
+    LPVOID view = Real_MapViewOfFile(mapping, desiredAccess, fileOffsetHigh, fileOffsetLow, bytesToMap);
+    MappingInfo info;
+    if (view && GetTrackedMapping(mapping, info)) {
+        ULARGE_INTEGER offset = {};
+        offset.LowPart = fileOffsetLow;
+        offset.HighPart = fileOffsetHigh;
+        LogEvent("MapViewOfFile", "script-map", info.path, static_cast<long long>(bytesToMap), info.scriptKind, FormatString("offset=%llu access=0x%08lX view=%p", offset.QuadPart, desiredAccess, view));
+        TrackMappedView(view, info, bytesToMap);
+    }
+    return view;
+}
+
+LPVOID WINAPI Hook_MapViewOfFileEx(HANDLE mapping, DWORD desiredAccess, DWORD fileOffsetHigh, DWORD fileOffsetLow, SIZE_T bytesToMap, LPVOID baseAddress)
+{
+    SOCKETU_GUARD_RETURN(Real_MapViewOfFileEx(mapping, desiredAccess, fileOffsetHigh, fileOffsetLow, bytesToMap, baseAddress));
+    LPVOID view = Real_MapViewOfFileEx(mapping, desiredAccess, fileOffsetHigh, fileOffsetLow, bytesToMap, baseAddress);
+    MappingInfo info;
+    if (view && GetTrackedMapping(mapping, info)) {
+        ULARGE_INTEGER offset = {};
+        offset.LowPart = fileOffsetLow;
+        offset.HighPart = fileOffsetHigh;
+        LogEvent("MapViewOfFileEx", "script-map", info.path, static_cast<long long>(bytesToMap), info.scriptKind, FormatString("offset=%llu access=0x%08lX view=%p requested_base=%p", offset.QuadPart, desiredAccess, view, baseAddress));
+        TrackMappedView(view, info, bytesToMap);
+    }
+    return view;
+}
+
+BOOL WINAPI Hook_UnmapViewOfFile(LPCVOID baseAddress)
+{
+    SOCKETU_GUARD_RETURN(Real_UnmapViewOfFile(baseAddress));
+    ViewInfo info;
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        auto it = g_ViewInfo.find(baseAddress);
+        if (it != g_ViewInfo.end()) {
+            info = it->second;
+        }
+    }
+
+    BOOL result = Real_UnmapViewOfFile(baseAddress);
+    if (!info.path.empty()) {
+        LogEvent("UnmapViewOfFile", "script-map-close", info.path, static_cast<long long>(info.viewSize), result ? info.scriptKind : FormatString("failed=%lu", GetLastError()), FormatString("view=%p", baseAddress));
+        if (result) {
+            RemoveMappedView(baseAddress);
+        }
+    }
+    return result;
+}
+
+BOOL WINAPI Hook_CloseHandle(HANDLE handle)
+{
+    SOCKETU_GUARD_RETURN(Real_CloseHandle(handle));
+    FileHandleInfo fileInfo;
+    MappingInfo mappingInfo;
+    bool hadFile = GetTrackedFile(handle, fileInfo);
+    bool hadMapping = GetTrackedMapping(handle, mappingInfo);
+
+    BOOL result = Real_CloseHandle(handle);
+    if (hadFile) {
+        LogEvent("CloseHandle", "script-file-close", fileInfo.path, static_cast<long long>(fileInfo.totalRead), result ? fileInfo.scriptKind : FormatString("failed=%lu", GetLastError()), FormatString("handle=%p file_size=%llu", handle, fileInfo.fileSize));
+    }
+    if (hadMapping) {
+        LogEvent("CloseHandle", "script-map-close", mappingInfo.path, static_cast<long long>(mappingInfo.fileSize), result ? mappingInfo.scriptKind : FormatString("failed=%lu", GetLastError()), FormatString("mapping=%p", handle));
+    }
+    if (result) {
+        RemoveTrackedHandle(handle);
+    }
+    return result;
 }
 
 // ===================================================================
@@ -1587,6 +2834,9 @@ int WINAPI Hook_send(SOCKET socket, const char* buffer, int length, int flags)
     SOCKETU_GUARD_RETURN(Real_send(socket, buffer, length, flags));
     std::string endpoint = SocketEndpoint(socket);
     LogEvent("send", "out", endpoint, length, FormatString("flags=%d", flags), {}, buffer, length > 0 ? static_cast<size_t>(length) : 0);
+    if (length > 0) {
+        ObserveSocketWebSocketPayload(socket, "send", "out", endpoint, buffer, static_cast<size_t>(length));
+    }
     return Real_send(socket, buffer, length, flags);
 }
 
@@ -1595,7 +2845,9 @@ int WINAPI Hook_recv(SOCKET socket, char* buffer, int length, int flags)
     SOCKETU_GUARD_RETURN(Real_recv(socket, buffer, length, flags));
     int result = Real_recv(socket, buffer, length, flags);
     if (result > 0) {
-        LogEvent("recv", "in", SocketEndpoint(socket), result, FormatString("flags=%d", flags), {}, buffer, static_cast<size_t>(result));
+        std::string endpoint = SocketEndpoint(socket);
+        LogEvent("recv", "in", endpoint, result, FormatString("flags=%d", flags), {}, buffer, static_cast<size_t>(result));
+        ObserveSocketWebSocketPayload(socket, "recv", "in", endpoint, buffer, static_cast<size_t>(result));
     }
     else {
         LogEvent("recv", "in", SocketEndpoint(socket), result, FormatString("flags=%d", flags));
@@ -1630,8 +2882,9 @@ int WINAPI Hook_WSASend(SOCKET socket, LPWSABUF buffers, DWORD bufferCount, LPDW
     SOCKETU_GUARD_RETURN(Real_WSASend(socket, buffers, bufferCount, bytesSent, flags, overlapped, completionRoutine));
     std::string endpoint = SocketEndpoint(socket);
     LogBuffers("WSASend", "out", endpoint, buffers, bufferCount);
+    ObserveSocketWebSocketBuffers(socket, "WSASend", "out", endpoint, buffers, bufferCount, static_cast<size_t>(-1));
     if (overlapped) {
-        TrackOverlappedOperation(overlapped, "WSASend", endpoint, false, buffers, bufferCount, completionRoutine);
+        TrackOverlappedOperation(overlapped, socket, "WSASend", endpoint, false, buffers, bufferCount, completionRoutine);
     }
     int result = Real_WSASend(socket, buffers, bufferCount, bytesSent, flags, overlapped, completionRoutine ? Hook_WSACompletionRoutine : nullptr);
     LogEvent("WSASend", "result", endpoint, bytesSent ? *bytesSent : 0, FormatString("result=%d flags=%lu overlapped=%s", result, flags, overlapped ? "yes" : "no"));
@@ -1647,7 +2900,7 @@ int WINAPI Hook_WSARecv(SOCKET socket, LPWSABUF buffers, DWORD bufferCount, LPDW
     SOCKETU_GUARD_RETURN(Real_WSARecv(socket, buffers, bufferCount, bytesReceived, flags, overlapped, completionRoutine));
     std::string endpoint = SocketEndpoint(socket);
     if (overlapped) {
-        TrackOverlappedOperation(overlapped, "WSARecv", endpoint, true, buffers, bufferCount, completionRoutine);
+        TrackOverlappedOperation(overlapped, socket, "WSARecv", endpoint, true, buffers, bufferCount, completionRoutine);
     }
     int result = Real_WSARecv(socket, buffers, bufferCount, bytesReceived, flags, overlapped, completionRoutine ? Hook_WSACompletionRoutine : nullptr);
     DWORD received = bytesReceived ? *bytesReceived : 0;
@@ -1658,6 +2911,7 @@ int WINAPI Hook_WSARecv(SOCKET socket, LPWSABUF buffers, DWORD bufferCount, LPDW
             DWORD chunk = buffers[i].len < remaining ? buffers[i].len : remaining;
             if (buffers[i].buf && chunk > 0) {
                 LogEvent("WSARecv", "in", endpoint, chunk, "buffer", FormatString("index=%lu", i), buffers[i].buf, chunk);
+                ObserveSocketWebSocketPayload(socket, "WSARecv", "in", endpoint, buffers[i].buf, chunk);
             }
             remaining -= chunk;
         }
@@ -1728,8 +2982,9 @@ int WSAAPI Hook_WSASendMsg(SOCKET socket, LPWSAMSG message, DWORD flags, LPDWORD
     std::string endpoint = SocketEndpoint(socket);
     if (message) {
         LogBuffers("WSASendMsg", "out", endpoint, message->lpBuffers, message->dwBufferCount);
+        ObserveSocketWebSocketBuffers(socket, "WSASendMsg", "out", endpoint, message->lpBuffers, message->dwBufferCount, static_cast<size_t>(-1));
         if (overlapped) {
-            TrackOverlappedOperation(overlapped, "WSASendMsg", endpoint, false, message->lpBuffers, message->dwBufferCount, completionRoutine);
+            TrackOverlappedOperation(overlapped, socket, "WSASendMsg", endpoint, false, message->lpBuffers, message->dwBufferCount, completionRoutine);
         }
     }
 
@@ -1747,7 +3002,7 @@ int WSAAPI Hook_WSARecvMsg(SOCKET socket, LPWSAMSG message, LPDWORD bytesReceive
     SOCKETU_GUARD_RETURN(Real_WSARecvMsg(socket, message, bytesReceived, overlapped, completionRoutine));
     std::string endpoint = SocketEndpoint(socket);
     if (message && overlapped) {
-        TrackOverlappedOperation(overlapped, "WSARecvMsg", endpoint, true, message->lpBuffers, message->dwBufferCount, completionRoutine);
+        TrackOverlappedOperation(overlapped, socket, "WSARecvMsg", endpoint, true, message->lpBuffers, message->dwBufferCount, completionRoutine);
     }
 
     int result = Real_WSARecvMsg(socket, message, bytesReceived, overlapped, completionRoutine ? Hook_WSACompletionRoutine : nullptr);
@@ -1758,6 +3013,7 @@ int WSAAPI Hook_WSARecvMsg(SOCKET socket, LPWSAMSG message, LPDWORD bytesReceive
             DWORD chunk = message->lpBuffers[i].len < remaining ? message->lpBuffers[i].len : remaining;
             if (message->lpBuffers[i].buf && chunk > 0) {
                 LogEvent("WSARecvMsg", "in", endpoint, chunk, "buffer", FormatString("index=%lu", i), message->lpBuffers[i].buf, chunk);
+                ObserveSocketWebSocketPayload(socket, "WSARecvMsg", "in", endpoint, message->lpBuffers[i].buf, chunk);
             }
             remaining -= chunk;
         }
@@ -1874,6 +3130,7 @@ int WINAPI Hook_closesocket(SOCKET socket)
     {
         std::lock_guard<std::mutex> lock(g_StateMutex);
         g_SocketToHost.erase(socket);
+        g_WebSocketSockets.erase(socket);
     }
     return result;
 }
@@ -1976,6 +3233,10 @@ BOOL WINAPI Hook_WinHttpSendRequest(HINTERNET request, LPCWSTR headers, DWORD he
     HttpHandleInfo info = GetHandleInfo(request);
     std::string endpoint = EndpointFromHttpInfo(info);
     std::string headerText = WideToUtf8(headers, headersLength == static_cast<DWORD>(-1) ? -1 : static_cast<int>(headersLength));
+    if (TextContainsWebSocketUpgrade(headerText)) {
+        info.webSocketUpgrade = true;
+        TrackHandle(request, info);
+    }
     LogHeaders("WinHttpSendRequest", endpoint, headerText);
     if (optional && optionalLength > 0) {
         LogEvent("WinHttpSendRequest", "out", endpoint, optionalLength, FormatString("total=%lu method=%s", totalLength, info.method.c_str()), {}, optional, optionalLength);
@@ -2016,9 +3277,13 @@ BOOL WINAPI Hook_WinHttpReadData(HINTERNET request, LPVOID buffer, DWORD bytesTo
     SOCKETU_GUARD_RETURN(Real_WinHttpReadData(request, buffer, bytesToRead, bytesRead));
     BOOL result = Real_WinHttpReadData(request, buffer, bytesToRead, bytesRead);
     DWORD read = bytesRead ? *bytesRead : 0;
-    std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(request));
+    HttpHandleInfo info = GetHandleInfo(request);
+    std::string endpoint = EndpointFromHttpInfo(info);
     if (result && read > 0) {
         LogEvent("WinHttpReadData", "in", endpoint, read, "ok", {}, buffer, read);
+        if (info.webSocketUpgrade) {
+            LogWebSocketWireFrames("WinHttpReadData", "in", endpoint, buffer, read);
+        }
     }
     else {
         LogEvent("WinHttpReadData", "in", endpoint, read, result ? "ok" : "failed");
@@ -2029,10 +3294,124 @@ BOOL WINAPI Hook_WinHttpReadData(HINTERNET request, LPVOID buffer, DWORD bytesTo
 BOOL WINAPI Hook_WinHttpWriteData(HINTERNET request, LPCVOID buffer, DWORD bytesToWrite, LPDWORD bytesWritten)
 {
     SOCKETU_GUARD_RETURN(Real_WinHttpWriteData(request, buffer, bytesToWrite, bytesWritten));
-    std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(request));
+    HttpHandleInfo info = GetHandleInfo(request);
+    std::string endpoint = EndpointFromHttpInfo(info);
     LogEvent("WinHttpWriteData", "out", endpoint, bytesToWrite, "before-call", {}, buffer, bytesToWrite);
+    if (info.webSocketUpgrade) {
+        LogWebSocketWireFrames("WinHttpWriteData", "out", endpoint, buffer, bytesToWrite);
+    }
     BOOL result = Real_WinHttpWriteData(request, buffer, bytesToWrite, bytesWritten);
     LogEvent("WinHttpWriteData", "result", endpoint, bytesWritten ? *bytesWritten : 0, result ? "ok" : "failed");
+    return result;
+}
+
+BOOL WINAPI Hook_WinHttpSetOption(HINTERNET handle, DWORD option, LPVOID buffer, DWORD bufferLength)
+{
+    SOCKETU_GUARD_RETURN(Real_WinHttpSetOption(handle, option, buffer, bufferLength));
+    BOOL result = Real_WinHttpSetOption(handle, option, buffer, bufferLength);
+    if (option == WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET) {
+        MarkHttpHandleWebSocketUpgrade(handle);
+        std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(handle));
+        LogEvent(
+            "WinHttpSetOption",
+            "websocket-upgrade",
+            endpoint,
+            bufferLength,
+            result ? "ok" : FormatString("failed=%lu", GetLastError()),
+            FormatString("option=WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET buffer=%p", buffer));
+    }
+    return result;
+}
+
+HINTERNET WINAPI Hook_WinHttpWebSocketCompleteUpgrade(HINTERNET request, DWORD_PTR context)
+{
+    SOCKETU_GUARD_RETURN(Real_WinHttpWebSocketCompleteUpgrade(request, context));
+    HttpHandleInfo info = GetHandleInfo(request);
+    info.kind = "winhttp-websocket";
+    info.webSocketUpgrade = true;
+    if (info.method.empty()) {
+        info.method = "GET";
+    }
+
+    HINTERNET webSocket = Real_WinHttpWebSocketCompleteUpgrade(request, context);
+    if (webSocket) {
+        TrackHandle(webSocket, info);
+    }
+
+    LogEvent(
+        "WinHttpWebSocketCompleteUpgrade",
+        "websocket-open",
+        EndpointFromHttpInfo(info),
+        0,
+        webSocket ? "ok" : FormatString("failed=%lu", GetLastError()),
+        FormatString("request=%p websocket=%p context=%llu", request, webSocket, static_cast<unsigned long long>(context)));
+    return webSocket;
+}
+
+DWORD WINAPI Hook_WinHttpWebSocketSend(HINTERNET webSocket, WINHTTP_WEB_SOCKET_BUFFER_TYPE bufferType, PVOID buffer, DWORD bufferLength)
+{
+    SOCKETU_GUARD_RETURN(Real_WinHttpWebSocketSend(webSocket, bufferType, buffer, bufferLength));
+    HttpHandleInfo info = GetHandleInfo(webSocket);
+    std::string endpoint = EndpointFromHttpInfo(info);
+    LogWebSocketApiMessage("WinHttpWebSocketSend", "websocket-out", endpoint, bufferType, ERROR_SUCCESS, buffer, bufferLength, "before-call");
+    DWORD result = Real_WinHttpWebSocketSend(webSocket, bufferType, buffer, bufferLength);
+    if (result != ERROR_SUCCESS) {
+        LogWebSocketApiMessage("WinHttpWebSocketSend", "result", endpoint, bufferType, result, nullptr, 0);
+    }
+    return result;
+}
+
+DWORD WINAPI Hook_WinHttpWebSocketReceive(HINTERNET webSocket, PVOID buffer, DWORD bufferLength, DWORD* bytesRead, WINHTTP_WEB_SOCKET_BUFFER_TYPE* bufferType)
+{
+    SOCKETU_GUARD_RETURN(Real_WinHttpWebSocketReceive(webSocket, buffer, bufferLength, bytesRead, bufferType));
+    DWORD result = Real_WinHttpWebSocketReceive(webSocket, buffer, bufferLength, bytesRead, bufferType);
+    DWORD actual = bytesRead ? *bytesRead : 0;
+    WINHTTP_WEB_SOCKET_BUFFER_TYPE type = bufferType ? *bufferType : WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
+    std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(webSocket));
+    if (result == ERROR_SUCCESS && actual > 0) {
+        LogWebSocketApiMessage("WinHttpWebSocketReceive", "websocket-in", endpoint, type, result, buffer, actual, FormatString("buffer_length=%lu", bufferLength));
+    }
+    else {
+        LogWebSocketApiMessage("WinHttpWebSocketReceive", "websocket-in", endpoint, type, result, nullptr, 0, FormatString("bytes_read=%lu buffer_length=%lu", actual, bufferLength));
+    }
+    return result;
+}
+
+DWORD WINAPI Hook_WinHttpWebSocketClose(HINTERNET webSocket, USHORT status, PVOID reason, DWORD reasonLength)
+{
+    SOCKETU_GUARD_RETURN(Real_WinHttpWebSocketClose(webSocket, status, reason, reasonLength));
+    std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(webSocket));
+    LogEvent("WinHttpWebSocketClose", "websocket-close-out", endpoint, reasonLength, FormatString("status=%hu", status), {}, reason, reasonLength);
+    DWORD result = Real_WinHttpWebSocketClose(webSocket, status, reason, reasonLength);
+    LogEvent("WinHttpWebSocketClose", "result", endpoint, 0, result == ERROR_SUCCESS ? "ok" : FormatString("error=%lu", result));
+    return result;
+}
+
+DWORD WINAPI Hook_WinHttpWebSocketShutdown(HINTERNET webSocket, USHORT status, PVOID reason, DWORD reasonLength)
+{
+    SOCKETU_GUARD_RETURN(Real_WinHttpWebSocketShutdown(webSocket, status, reason, reasonLength));
+    std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(webSocket));
+    LogEvent("WinHttpWebSocketShutdown", "websocket-shutdown", endpoint, reasonLength, FormatString("status=%hu", status), {}, reason, reasonLength);
+    DWORD result = Real_WinHttpWebSocketShutdown(webSocket, status, reason, reasonLength);
+    LogEvent("WinHttpWebSocketShutdown", "result", endpoint, 0, result == ERROR_SUCCESS ? "ok" : FormatString("error=%lu", result));
+    return result;
+}
+
+DWORD WINAPI Hook_WinHttpWebSocketQueryCloseStatus(HINTERNET webSocket, USHORT* status, PVOID reason, DWORD reasonLength, DWORD* reasonLengthConsumed)
+{
+    SOCKETU_GUARD_RETURN(Real_WinHttpWebSocketQueryCloseStatus(webSocket, status, reason, reasonLength, reasonLengthConsumed));
+    DWORD result = Real_WinHttpWebSocketQueryCloseStatus(webSocket, status, reason, reasonLength, reasonLengthConsumed);
+    DWORD actual = reasonLengthConsumed ? *reasonLengthConsumed : 0;
+    std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(webSocket));
+    LogEvent(
+        "WinHttpWebSocketQueryCloseStatus",
+        "websocket-close-in",
+        endpoint,
+        actual,
+        result == ERROR_SUCCESS ? FormatString("status=%hu", status ? *status : 0) : FormatString("error=%lu", result),
+        FormatString("reason_buffer=%lu", reasonLength),
+        reason,
+        result == ERROR_SUCCESS && reason && actual > 0 ? actual : 0);
     return result;
 }
 
@@ -2129,7 +3508,12 @@ BOOL WINAPI Hook_HttpSendRequestA(HINTERNET request, LPCSTR headers, DWORD heade
     SOCKETU_GUARD_RETURN(Real_HttpSendRequestA(request, headers, headersLength, optional, optionalLength));
     HttpHandleInfo info = GetHandleInfo(request);
     std::string endpoint = EndpointFromHttpInfo(info);
-    LogHeaders("HttpSendRequestA", endpoint, AnsiString(headers, headersLength));
+    std::string headerText = AnsiString(headers, headersLength);
+    if (TextContainsWebSocketUpgrade(headerText)) {
+        info.webSocketUpgrade = true;
+        TrackHandle(request, info);
+    }
+    LogHeaders("HttpSendRequestA", endpoint, headerText);
     if (optional && optionalLength > 0) {
         LogEvent("HttpSendRequestA", "out", endpoint, optionalLength, FormatString("method=%s", info.method.c_str()), {}, optional, optionalLength);
     }
@@ -2145,6 +3529,10 @@ BOOL WINAPI Hook_HttpSendRequestW(HINTERNET request, LPCWSTR headers, DWORD head
     HttpHandleInfo info = GetHandleInfo(request);
     std::string endpoint = EndpointFromHttpInfo(info);
     std::string headerText = WideToUtf8(headers, headersLength == static_cast<DWORD>(-1) ? -1 : static_cast<int>(headersLength));
+    if (TextContainsWebSocketUpgrade(headerText)) {
+        info.webSocketUpgrade = true;
+        TrackHandle(request, info);
+    }
     LogHeaders("HttpSendRequestW", endpoint, headerText);
     if (optional && optionalLength > 0) {
         LogEvent("HttpSendRequestW", "out", endpoint, optionalLength, FormatString("method=%s", info.method.c_str()), {}, optional, optionalLength);
@@ -2189,9 +3577,13 @@ BOOL WINAPI Hook_InternetReadFile(HINTERNET file, LPVOID buffer, DWORD bytesToRe
     SOCKETU_GUARD_RETURN(Real_InternetReadFile(file, buffer, bytesToRead, bytesRead));
     BOOL result = Real_InternetReadFile(file, buffer, bytesToRead, bytesRead);
     DWORD read = bytesRead ? *bytesRead : 0;
-    std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(file));
+    HttpHandleInfo info = GetHandleInfo(file);
+    std::string endpoint = EndpointFromHttpInfo(info);
     if (result && read > 0) {
         LogEvent("InternetReadFile", "in", endpoint, read, "ok", {}, buffer, read);
+        if (info.webSocketUpgrade) {
+            LogWebSocketWireFrames("InternetReadFile", "in", endpoint, buffer, read);
+        }
     }
     else {
         LogEvent("InternetReadFile", "in", endpoint, read, result ? "ok" : "failed");
@@ -2202,8 +3594,12 @@ BOOL WINAPI Hook_InternetReadFile(HINTERNET file, LPVOID buffer, DWORD bytesToRe
 BOOL WINAPI Hook_InternetWriteFile(HINTERNET file, LPCVOID buffer, DWORD bytesToWrite, LPDWORD bytesWritten)
 {
     SOCKETU_GUARD_RETURN(Real_InternetWriteFile(file, buffer, bytesToWrite, bytesWritten));
-    std::string endpoint = EndpointFromHttpInfo(GetHandleInfo(file));
+    HttpHandleInfo info = GetHandleInfo(file);
+    std::string endpoint = EndpointFromHttpInfo(info);
     LogEvent("InternetWriteFile", "out", endpoint, bytesToWrite, "before-call", {}, buffer, bytesToWrite);
+    if (info.webSocketUpgrade) {
+        LogWebSocketWireFrames("InternetWriteFile", "out", endpoint, buffer, bytesToWrite);
+    }
     BOOL result = Real_InternetWriteFile(file, buffer, bytesToWrite, bytesWritten);
     LogEvent("InternetWriteFile", "result", endpoint, bytesWritten ? *bytesWritten : 0, result ? "ok" : "failed");
     return result;
@@ -2231,6 +3627,7 @@ SECURITY_STATUS WINAPI Hook_EncryptMessage(PCtxtHandle context, ULONG qop, PSecB
             SecBuffer& buffer = message->pBuffers[i];
             if (buffer.BufferType == SECBUFFER_DATA && buffer.pvBuffer && buffer.cbBuffer > 0) {
                 LogEvent("EncryptMessage", "tls-out", "?", buffer.cbBuffer, "before-call", {}, buffer.pvBuffer, buffer.cbBuffer);
+                ObserveSchannelWebSocketPayload(context, "EncryptMessage", "tls-out", "schannel", buffer.pvBuffer, buffer.cbBuffer);
             }
         }
     }
@@ -2246,6 +3643,7 @@ SECURITY_STATUS WINAPI Hook_DecryptMessage(PCtxtHandle context, PSecBufferDesc m
             SecBuffer& buffer = message->pBuffers[i];
             if (buffer.BufferType == SECBUFFER_DATA && buffer.pvBuffer && buffer.cbBuffer > 0) {
                 LogEvent("DecryptMessage", "tls-in", "?", buffer.cbBuffer, "ok", {}, buffer.pvBuffer, buffer.cbBuffer);
+                ObserveSchannelWebSocketPayload(context, "DecryptMessage", "tls-in", "schannel", buffer.pvBuffer, buffer.cbBuffer);
             }
         }
     }
@@ -2265,6 +3663,7 @@ int WINAPI Hook_SSL_read(void* ssl, void* buffer, int count)
     int result = Real_SSL_read(ssl, buffer, count);
     if (result > 0) {
         LogEvent("SSL_read", "tls-in", "openssl", result, "ok", {}, buffer, static_cast<size_t>(result));
+        ObserveOpenSslWebSocketPayload(ssl, "SSL_read", "tls-in", "openssl", buffer, static_cast<size_t>(result));
     }
     else {
         LogEvent("SSL_read", "tls-in", "openssl", result);
@@ -2276,6 +3675,9 @@ int WINAPI Hook_SSL_write(void* ssl, const void* buffer, int count)
 {
     SOCKETU_GUARD_RETURN(Real_SSL_write(ssl, buffer, count));
     LogEvent("SSL_write", "tls-out", "openssl", count, "before-call", {}, buffer, count > 0 ? static_cast<size_t>(count) : 0);
+    if (count > 0) {
+        ObserveOpenSslWebSocketPayload(ssl, "SSL_write", "tls-out", "openssl", buffer, static_cast<size_t>(count));
+    }
     int result = Real_SSL_write(ssl, buffer, count);
     LogEvent("SSL_write", "result", "openssl", result);
     return result;
@@ -2288,6 +3690,7 @@ int WINAPI Hook_SSL_read_ex(void* ssl, void* buffer, size_t count, size_t* readB
     size_t actual = readBytes ? *readBytes : 0;
     if (result == 1 && actual > 0) {
         LogEvent("SSL_read_ex", "tls-in", "openssl", static_cast<long long>(actual), "ok", {}, buffer, actual);
+        ObserveOpenSslWebSocketPayload(ssl, "SSL_read_ex", "tls-in", "openssl", buffer, actual);
     }
     else {
         LogEvent("SSL_read_ex", "tls-in", "openssl", static_cast<long long>(actual), FormatString("result=%d", result));
@@ -2299,6 +3702,9 @@ int WINAPI Hook_SSL_write_ex(void* ssl, const void* buffer, size_t count, size_t
 {
     SOCKETU_GUARD_RETURN(Real_SSL_write_ex(ssl, buffer, count, written));
     LogEvent("SSL_write_ex", "tls-out", "openssl", static_cast<long long>(count), "before-call", {}, buffer, count);
+    if (count > 0) {
+        ObserveOpenSslWebSocketPayload(ssl, "SSL_write_ex", "tls-out", "openssl", buffer, count);
+    }
     int result = Real_SSL_write_ex(ssl, buffer, count, written);
     LogEvent("SSL_write_ex", "result", "openssl", written ? static_cast<long long>(*written) : 0, FormatString("result=%d", result));
     return result;
@@ -2331,6 +3737,104 @@ int Hook_lua_pcallk(void* state, int nargs, int nresults, int errfunc, intptr_t 
     SOCKETU_GUARD_RETURN(Real_lua_pcallk(state, nargs, nresults, errfunc, ctx, k));
     LogEvent("lua_pcallk", "script", "lua-runtime", 0, "lua", FormatString("nargs=%d nresults=%d errfunc=%d", nargs, nresults, errfunc));
     return Real_lua_pcallk(state, nargs, nresults, errfunc, ctx, k);
+}
+
+void __fastcall Hook_GraalDecryptScript(void* destStruct, void* nameArg, int a3, void* a4, int a5, void* a6)
+{
+    SOCKETU_GUARD_RETURN((Real_GraalDecryptScript(destStruct, nameArg, a3, a4, a5, a6), void()));
+    std::string scriptName = ReadGraalStringWrapper(nameArg);
+    LogEvent("GraalDecryptScript", "script-decrypt-enter", scriptName.empty() ? "graal-runtime" : scriptName, 0, "gs2", FormatString("dest=%p name_arg=%p a3=%d a4=%p a5=%d a6=%p", destStruct, nameArg, a3, a4, a5, a6));
+    Real_GraalDecryptScript(destStruct, nameArg, a3, a4, a5, a6);
+
+    void* bytecode = nullptr;
+    SafeReadValue(destStruct, bytecode);
+    LogGraalBytecode("GraalDecryptScript", bytecode, scriptName, "on_leave decrypted");
+}
+
+void __fastcall Hook_GraalExecScript(void* a1, void* a2, int a3, void* a4, void* a5)
+{
+    SOCKETU_GUARD_RETURN((Real_GraalExecScript(a1, a2, a3, a4, a5), void()));
+    std::string objectName = ReadGraalStringWrapper(a2);
+    LogGraalBytecode("GraalExecScript", a5, objectName, FormatString("a1=%p a2=%p a3=%d a4=%p", a1, a2, a3, a4));
+    Real_GraalExecScript(a1, a2, a3, a4, a5);
+}
+
+void __fastcall Hook_GraalBindBytecode(void* scriptObject, void* bytecode)
+{
+    SOCKETU_GUARD_RETURN((Real_GraalBindBytecode(scriptObject, bytecode), void()));
+    LogGraalBytecode("GraalBindBytecode", bytecode, "script-object", FormatString("script_object=%p", scriptObject));
+    Real_GraalBindBytecode(scriptObject, bytecode);
+}
+
+int64_t __fastcall Hook_GraalEventCall(void* object, void* eventName, const char* format, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t a9)
+{
+    SOCKETU_GUARD_RETURN(Real_GraalEventCall(object, eventName, format, a4, a5, a6, a7, a8, a9));
+    std::string event = ReadGraalStringWrapper(eventName);
+    LogEvent(
+        "GraalEventCall",
+        "script-event-call",
+        event.empty() ? "graal-runtime" : event,
+        0,
+        "gs2",
+        FormatString("object=%p event_arg=%p format=%s args=[%s,%s,%s,%s,%s,%s]", object, eventName, format ? format : "?", HexAddress(a4).c_str(), HexAddress(a5).c_str(), HexAddress(a6).c_str(), HexAddress(a7).c_str(), HexAddress(a8).c_str(), HexAddress(a9).c_str()));
+    return Real_GraalEventCall(object, eventName, format, a4, a5, a6, a7, a8, a9);
+}
+
+void* __fastcall Hook_GraalFindObject(void* context, void* objectNameArg)
+{
+    SOCKETU_GUARD_RETURN(Real_GraalFindObject(context, objectNameArg));
+    std::string objectName = ReadGraalStringWrapper(objectNameArg);
+    void* result = Real_GraalFindObject(context, objectNameArg);
+    LogEvent("GraalFindObject", "script-object-find", objectName.empty() ? "graal-runtime" : objectName, 0, result ? "found-or-created" : "null", FormatString("context=%p name_arg=%p result=%p", context, objectNameArg, result));
+    return result;
+}
+
+void* __fastcall Hook_GraalFindInTable(void* tableRoot, int hash, void* nameArg)
+{
+    SOCKETU_GUARD_RETURN(Real_GraalFindInTable(tableRoot, hash, nameArg));
+    std::string name = ReadGraalStringWrapper(nameArg);
+    void* result = Real_GraalFindInTable(tableRoot, hash, nameArg);
+    LogEvent("GraalFindInTable", "script-function-lookup", name.empty() ? "graal-runtime" : name, 0, result ? "found" : "missing", FormatString("table=%p hash=0x%08X name_arg=%p result=%p", tableRoot, static_cast<unsigned>(hash), nameArg, result));
+    return result;
+}
+
+void* __fastcall Hook_GraalExecEvent(void* eventBlock, void* arg)
+{
+    SOCKETU_GUARD_RETURN(Real_GraalExecEvent(eventBlock, arg));
+    LogEvent("GraalExecEvent", "script-event-exec", "graal-runtime", 0, "gs2", FormatString("event_block=%p arg=%p", eventBlock, arg));
+    return Real_GraalExecEvent(eventBlock, arg);
+}
+
+int64_t __fastcall Hook_GraalOpCall(void* vmContext, void* eventArg)
+{
+    SOCKETU_GUARD_RETURN(Real_GraalOpCall(vmContext, eventArg));
+    std::string event = ReadGraalStringWrapper(eventArg);
+    LogEvent("GraalOpCall", "script-op-call", event.empty() ? "graal-runtime" : event, 0, "gs2", FormatString("vm_context=%p event_arg=%p", vmContext, eventArg));
+    return Real_GraalOpCall(vmContext, eventArg);
+}
+
+void* __fastcall Hook_GraalLookupFunction(void* tableOrObject, void* nameArg)
+{
+    SOCKETU_GUARD_RETURN(Real_GraalLookupFunction(tableOrObject, nameArg));
+    std::string name = ReadGraalStringWrapper(nameArg);
+    void* result = Real_GraalLookupFunction(tableOrObject, nameArg);
+    LogEvent("GraalLookupFunction", "script-function-lookup", name.empty() ? "graal-runtime" : name, 0, result ? "found" : "missing", FormatString("table_or_object=%p name_arg=%p result=%p", tableOrObject, nameArg, result));
+    return result;
+}
+
+void __fastcall Hook_GraalResolveVariable(void* variant, void* activeContext)
+{
+    SOCKETU_GUARD_RETURN((Real_GraalResolveVariable(variant, activeContext), void()));
+    int beforeType = -1;
+    SafeReadValue(variant, beforeType);
+    Real_GraalResolveVariable(variant, activeContext);
+    int afterType = -1;
+    SafeReadValue(variant, afterType);
+    std::string value;
+    if (afterType == 2) {
+        value = ReadGraalStringWrapper(variant);
+    }
+    LogEvent("GraalResolveVariable", "script-value-resolve", "graal-runtime", static_cast<long long>(value.size()), "gs2", FormatString("variant=%p context=%p type=%d->%d", variant, activeContext, beforeType, afterType), value.data(), value.size());
 }
 
 bool InstallDynamicHook(HMODULE module, const char* name, LPVOID hook, LPVOID* original)
@@ -2366,6 +3870,42 @@ bool InstallDynamicHook(HMODULE module, const char* name, LPVOID hook, LPVOID* o
     return true;
 }
 
+bool InstallDynamicHookAtAddress(LPVOID target, const char* name, LPVOID hook, LPVOID* original)
+{
+    if (!target || !name || !hook || !original || !g_MinHookInitialized.load()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_DynamicHookMutex);
+    if (g_DynamicHookTargets.find(target) != g_DynamicHookTargets.end()) {
+        return false;
+    }
+
+    MH_STATUS createStatus = MH_CreateHook(target, hook, original);
+    if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED) {
+        LogMessage("Dynamic RVA hook failed: %s target=%p -> %s", name, target, MH_StatusToString(createStatus));
+        return false;
+    }
+
+    MH_STATUS enableStatus = MH_EnableHook(target);
+    if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED) {
+        LogMessage("Dynamic RVA hook enable failed: %s target=%p -> %s", name, target, MH_StatusToString(enableStatus));
+        return false;
+    }
+
+    g_DynamicHookTargets.insert(target);
+    LogMessage("Dynamic RVA hook enabled: %s target=%p", name, target);
+    return true;
+}
+
+LPVOID RvaTarget(HMODULE module, uintptr_t rva)
+{
+    if (!module || rva == 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<unsigned char*>(module) + rva;
+}
+
 void TryInstallOpenSslHooks(HMODULE module)
 {
     if (!module) {
@@ -2386,11 +3926,257 @@ void TryInstallOpenSslHooks(HMODULE module)
     }
 }
 
+bool GetModuleImageInfo(HMODULE module, IMAGE_NT_HEADERS** ntHeaders, std::string* moduleName)
+{
+    if (!module || !ntHeaders) {
+        return false;
+    }
+
+    auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(module);
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        return false;
+    }
+
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<unsigned char*>(module) + dosHeader->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return false;
+    }
+
+    if (moduleName) {
+        char path[MAX_PATH] = {};
+        if (GetModuleFileNameA(module, path, static_cast<DWORD>(sizeof(path)))) {
+            const char* name = PathFindFileNameA(path);
+            *moduleName = name ? name : path;
+        }
+        else {
+            *moduleName = FormatString("module@%p", module);
+        }
+    }
+
+    *ntHeaders = nt;
+    return true;
+}
+
+void ScanModuleScriptExports(HMODULE module)
+{
+    if (!g_Config.scriptExportScan || !module) {
+        return;
+    }
+
+    IMAGE_NT_HEADERS* nt = nullptr;
+    std::string moduleName;
+    if (!GetModuleImageInfo(module, &nt, &moduleName) || !IsLikelyGameModuleName(moduleName)) {
+        return;
+    }
+
+    IMAGE_DATA_DIRECTORY exportDirectoryData = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (exportDirectoryData.VirtualAddress == 0 || exportDirectoryData.Size == 0) {
+        return;
+    }
+
+    auto* base = reinterpret_cast<unsigned char*>(module);
+    auto* exportDirectory = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + exportDirectoryData.VirtualAddress);
+    auto* names = reinterpret_cast<DWORD*>(base + exportDirectory->AddressOfNames);
+    auto* ordinals = reinterpret_cast<WORD*>(base + exportDirectory->AddressOfNameOrdinals);
+    auto* functions = reinterpret_cast<DWORD*>(base + exportDirectory->AddressOfFunctions);
+
+    int logged = 0;
+    for (DWORD i = 0; i < exportDirectory->NumberOfNames && logged < g_Config.maxScriptExportLogs; ++i) {
+        const char* exportName = reinterpret_cast<const char*>(base + names[i]);
+        if (!exportName || !IsLikelyScriptExportName(exportName)) {
+            continue;
+        }
+
+        WORD ordinalIndex = ordinals[i];
+        DWORD functionRva = functions[ordinalIndex];
+        void* functionAddress = base + functionRva;
+        std::string exportKind = DetectScriptKindFromText(exportName);
+        if (exportKind.empty()) {
+            exportKind = "script-export";
+        }
+
+        LogEvent(
+            "ScriptExportScan",
+            "script-export",
+            moduleName,
+            0,
+            exportKind,
+            FormatString(
+                "module_base=%p export=%s ordinal=%u rva=%s va=%s",
+                module,
+                exportName,
+                static_cast<unsigned>(exportDirectory->Base + ordinalIndex),
+                HexAddress(functionRva).c_str(),
+                HexAddress(reinterpret_cast<uintptr_t>(functionAddress)).c_str()));
+        logged++;
+    }
+
+    if (logged > 0) {
+        LogEvent("ScriptExportScan", "script-export-summary", moduleName, logged, "ok", FormatString("module_base=%p export_count=%lu", module, exportDirectory->NumberOfNames));
+    }
+}
+
+void ScanAsciiScriptStringsInSection(HMODULE module, const std::string& moduleName, IMAGE_SECTION_HEADER* section, int& logged)
+{
+    if (!section || logged >= g_Config.maxScriptStringLogs) {
+        return;
+    }
+
+    auto* base = reinterpret_cast<unsigned char*>(module);
+    DWORD virtualSize = section->Misc.VirtualSize;
+    DWORD rawSize = section->SizeOfRawData;
+    DWORD sectionSize = virtualSize != 0 ? virtualSize : rawSize;
+    if (sectionSize == 0 || sectionSize > 64u * 1024u * 1024u) {
+        return;
+    }
+
+    const unsigned char* start = base + section->VirtualAddress;
+    const unsigned char* end = start + sectionSize;
+    const unsigned char* current = start;
+    while (current < end && logged < g_Config.maxScriptStringLogs) {
+        while (current < end && !std::isprint(*current)) {
+            current++;
+        }
+
+        const unsigned char* textStart = current;
+        while (current < end && (std::isprint(*current) || *current == '\t')) {
+            current++;
+        }
+
+        size_t length = static_cast<size_t>(current - textStart);
+        if (length >= 5 && length <= 1024) {
+            std::string text(reinterpret_cast<const char*>(textStart), length);
+            std::string scriptKind = DetectScriptKindFromText(text);
+            if (scriptKind.empty()) {
+                scriptKind = DetectScriptKindFromPath(text);
+            }
+
+            if (!scriptKind.empty()) {
+                char sectionName[9] = {};
+                memcpy(sectionName, section->Name, 8);
+                DWORD rva = static_cast<DWORD>(textStart - base);
+                LogEvent(
+                    "ScriptStringScan",
+                    "script-string",
+                    moduleName,
+                    static_cast<long long>(length),
+                    scriptKind,
+                    FormatString("module_base=%p section=%s rva=%s", module, sectionName, HexAddress(rva).c_str()),
+                    text.data(),
+                    text.size());
+                logged++;
+            }
+        }
+
+        current++;
+    }
+}
+
+void ScanModuleScriptStrings(HMODULE module)
+{
+    if (!g_Config.scriptStringScan || !module) {
+        return;
+    }
+
+    IMAGE_NT_HEADERS* nt = nullptr;
+    std::string moduleName;
+    if (!GetModuleImageInfo(module, &nt, &moduleName) || !IsLikelyGameModuleName(moduleName)) {
+        return;
+    }
+
+    auto* firstSection = IMAGE_FIRST_SECTION(nt);
+    int logged = 0;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections && logged < g_Config.maxScriptStringLogs; ++i) {
+        IMAGE_SECTION_HEADER* section = &firstSection[i];
+        DWORD characteristics = section->Characteristics;
+        bool readableData = (characteristics & IMAGE_SCN_MEM_READ) != 0 &&
+            ((characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0 || (characteristics & IMAGE_SCN_CNT_CODE) != 0);
+        if (readableData) {
+            ScanAsciiScriptStringsInSection(module, moduleName, section, logged);
+        }
+    }
+
+    if (logged > 0) {
+        LogEvent("ScriptStringScan", "script-string-summary", moduleName, logged, "ok", FormatString("module_base=%p", module));
+    }
+}
+
+void ScanModuleForScriptDetails(HMODULE module)
+{
+    if (!module) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_DynamicHookMutex);
+        if (g_ScriptScannedModules.find(module) != g_ScriptScannedModules.end()) {
+            return;
+        }
+        g_ScriptScannedModules.insert(module);
+    }
+
+    ScanModuleScriptExports(module);
+    ScanModuleScriptStrings(module);
+}
+
+void TryInstallGraalProbes(HMODULE module)
+{
+    if (!ShouldProbeGraalModule(module)) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_DynamicHookMutex);
+        if (g_GraalProbeModules.find(module) != g_GraalProbeModules.end()) {
+            return;
+        }
+        g_GraalProbeModules.insert(module);
+    }
+
+    std::string moduleName = ModuleNameFromHandle(module);
+    LogEvent(
+        "GraalProbe",
+        "script-probe-enable",
+        moduleName,
+        0,
+        "gs2",
+        FormatString(
+            "module_base=%p decrypt=%s exec=%s bind=%s event=%s find_object=%s find_table=%s exec_event=%s op_call=%s lookup=%s resolve=%s context=%s xor_key=%s",
+            module,
+            HexAddress(g_Config.graalDecryptScriptRva).c_str(),
+            HexAddress(g_Config.graalExecScriptRva).c_str(),
+            HexAddress(g_Config.graalBindBytecodeRva).c_str(),
+            HexAddress(g_Config.graalEventCallRva).c_str(),
+            HexAddress(g_Config.graalFindObjectRva).c_str(),
+            HexAddress(g_Config.graalFindInTableRva).c_str(),
+            HexAddress(g_Config.graalExecEventRva).c_str(),
+            HexAddress(g_Config.graalOpCallRva).c_str(),
+            HexAddress(g_Config.graalLookupFunctionRva).c_str(),
+            HexAddress(g_Config.graalResolveVariableRva).c_str(),
+            HexAddress(g_Config.graalGlobalContextRva).c_str(),
+            HexAddress(g_Config.graalXorKeyRva).c_str()));
+
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalDecryptScriptRva), "GraalDecryptScript", reinterpret_cast<LPVOID>(Hook_GraalDecryptScript), reinterpret_cast<LPVOID*>(&Real_GraalDecryptScript));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalExecScriptRva), "GraalExecScript", reinterpret_cast<LPVOID>(Hook_GraalExecScript), reinterpret_cast<LPVOID*>(&Real_GraalExecScript));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalBindBytecodeRva), "GraalBindBytecode", reinterpret_cast<LPVOID>(Hook_GraalBindBytecode), reinterpret_cast<LPVOID*>(&Real_GraalBindBytecode));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalEventCallRva), "GraalEventCall", reinterpret_cast<LPVOID>(Hook_GraalEventCall), reinterpret_cast<LPVOID*>(&Real_GraalEventCall));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalFindObjectRva), "GraalFindObject", reinterpret_cast<LPVOID>(Hook_GraalFindObject), reinterpret_cast<LPVOID*>(&Real_GraalFindObject));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalFindInTableRva), "GraalFindInTable", reinterpret_cast<LPVOID>(Hook_GraalFindInTable), reinterpret_cast<LPVOID*>(&Real_GraalFindInTable));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalExecEventRva), "GraalExecEvent", reinterpret_cast<LPVOID>(Hook_GraalExecEvent), reinterpret_cast<LPVOID*>(&Real_GraalExecEvent));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalOpCallRva), "GraalOpCall", reinterpret_cast<LPVOID>(Hook_GraalOpCall), reinterpret_cast<LPVOID*>(&Real_GraalOpCall));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalLookupFunctionRva), "GraalLookupFunction", reinterpret_cast<LPVOID>(Hook_GraalLookupFunction), reinterpret_cast<LPVOID*>(&Real_GraalLookupFunction));
+    InstallDynamicHookAtAddress(RvaTarget(module, g_Config.graalResolveVariableRva), "GraalResolveVariable", reinterpret_cast<LPVOID>(Hook_GraalResolveVariable), reinterpret_cast<LPVOID*>(&Real_GraalResolveVariable));
+    ScanGraalScriptManager(module, "probe-install");
+}
+
 void TryInstallScriptRuntimeHooks(HMODULE module)
 {
     if (!module) {
         return;
     }
+
+    ScanModuleForScriptDetails(module);
+    TryInstallGraalProbes(module);
 
     if (!Real_luaL_loadbufferx) {
         InstallDynamicHook(module, "luaL_loadbufferx", reinterpret_cast<LPVOID>(Hook_luaL_loadbufferx), reinterpret_cast<LPVOID*>(&Real_luaL_loadbufferx));
@@ -2478,6 +4264,15 @@ static std::vector<HookEntry> g_HookTable = {
     { L"kernel32.dll", "LoadLibraryW",        reinterpret_cast<LPVOID*>(&Real_LoadLibraryW),       reinterpret_cast<LPVOID>(Hook_LoadLibraryW) },
     { L"kernel32.dll", "LoadLibraryExA",      reinterpret_cast<LPVOID*>(&Real_LoadLibraryExA),     reinterpret_cast<LPVOID>(Hook_LoadLibraryExA) },
     { L"kernel32.dll", "LoadLibraryExW",      reinterpret_cast<LPVOID*>(&Real_LoadLibraryExW),     reinterpret_cast<LPVOID>(Hook_LoadLibraryExW) },
+    { L"kernel32.dll", "CreateFileA",         reinterpret_cast<LPVOID*>(&Real_CreateFileA),        reinterpret_cast<LPVOID>(Hook_CreateFileA) },
+    { L"kernel32.dll", "CreateFileW",         reinterpret_cast<LPVOID*>(&Real_CreateFileW),        reinterpret_cast<LPVOID>(Hook_CreateFileW) },
+    { L"kernel32.dll", "ReadFile",            reinterpret_cast<LPVOID*>(&Real_ReadFile),           reinterpret_cast<LPVOID>(Hook_ReadFile) },
+    { L"kernel32.dll", "CloseHandle",         reinterpret_cast<LPVOID*>(&Real_CloseHandle),        reinterpret_cast<LPVOID>(Hook_CloseHandle) },
+    { L"kernel32.dll", "CreateFileMappingA",  reinterpret_cast<LPVOID*>(&Real_CreateFileMappingA), reinterpret_cast<LPVOID>(Hook_CreateFileMappingA) },
+    { L"kernel32.dll", "CreateFileMappingW",  reinterpret_cast<LPVOID*>(&Real_CreateFileMappingW), reinterpret_cast<LPVOID>(Hook_CreateFileMappingW) },
+    { L"kernel32.dll", "MapViewOfFile",       reinterpret_cast<LPVOID*>(&Real_MapViewOfFile),      reinterpret_cast<LPVOID>(Hook_MapViewOfFile) },
+    { L"kernel32.dll", "MapViewOfFileEx",     reinterpret_cast<LPVOID*>(&Real_MapViewOfFileEx),    reinterpret_cast<LPVOID>(Hook_MapViewOfFileEx) },
+    { L"kernel32.dll", "UnmapViewOfFile",     reinterpret_cast<LPVOID*>(&Real_UnmapViewOfFile),    reinterpret_cast<LPVOID>(Hook_UnmapViewOfFile) },
     { L"kernel32.dll", "GetOverlappedResult", reinterpret_cast<LPVOID*>(&Real_GetOverlappedResult), reinterpret_cast<LPVOID>(Hook_GetOverlappedResult) },
     { L"kernel32.dll", "GetQueuedCompletionStatus", reinterpret_cast<LPVOID*>(&Real_GetQueuedCompletionStatus), reinterpret_cast<LPVOID>(Hook_GetQueuedCompletionStatus) },
     { L"kernel32.dll", "GetQueuedCompletionStatusEx", reinterpret_cast<LPVOID*>(&Real_GetQueuedCompletionStatusEx), reinterpret_cast<LPVOID>(Hook_GetQueuedCompletionStatusEx) },
@@ -2510,6 +4305,13 @@ static std::vector<HookEntry> g_HookTable = {
     { L"winhttp.dll", "WinHttpQueryHeaders", reinterpret_cast<LPVOID*>(&Real_WinHttpQueryHeaders), reinterpret_cast<LPVOID>(Hook_WinHttpQueryHeaders) },
     { L"winhttp.dll", "WinHttpReadData",     reinterpret_cast<LPVOID*>(&Real_WinHttpReadData),    reinterpret_cast<LPVOID>(Hook_WinHttpReadData) },
     { L"winhttp.dll", "WinHttpWriteData",    reinterpret_cast<LPVOID*>(&Real_WinHttpWriteData),   reinterpret_cast<LPVOID>(Hook_WinHttpWriteData) },
+    { L"winhttp.dll", "WinHttpSetOption",    reinterpret_cast<LPVOID*>(&Real_WinHttpSetOption),   reinterpret_cast<LPVOID>(Hook_WinHttpSetOption) },
+    { L"winhttp.dll", "WinHttpWebSocketCompleteUpgrade", reinterpret_cast<LPVOID*>(&Real_WinHttpWebSocketCompleteUpgrade), reinterpret_cast<LPVOID>(Hook_WinHttpWebSocketCompleteUpgrade) },
+    { L"winhttp.dll", "WinHttpWebSocketSend", reinterpret_cast<LPVOID*>(&Real_WinHttpWebSocketSend), reinterpret_cast<LPVOID>(Hook_WinHttpWebSocketSend) },
+    { L"winhttp.dll", "WinHttpWebSocketReceive", reinterpret_cast<LPVOID*>(&Real_WinHttpWebSocketReceive), reinterpret_cast<LPVOID>(Hook_WinHttpWebSocketReceive) },
+    { L"winhttp.dll", "WinHttpWebSocketClose", reinterpret_cast<LPVOID*>(&Real_WinHttpWebSocketClose), reinterpret_cast<LPVOID>(Hook_WinHttpWebSocketClose) },
+    { L"winhttp.dll", "WinHttpWebSocketShutdown", reinterpret_cast<LPVOID*>(&Real_WinHttpWebSocketShutdown), reinterpret_cast<LPVOID>(Hook_WinHttpWebSocketShutdown) },
+    { L"winhttp.dll", "WinHttpWebSocketQueryCloseStatus", reinterpret_cast<LPVOID*>(&Real_WinHttpWebSocketQueryCloseStatus), reinterpret_cast<LPVOID>(Hook_WinHttpWebSocketQueryCloseStatus) },
     { L"winhttp.dll", "WinHttpCloseHandle",  reinterpret_cast<LPVOID*>(&Real_WinHttpCloseHandle), reinterpret_cast<LPVOID>(Hook_WinHttpCloseHandle) },
 
     { L"wininet.dll", "InternetOpenA",       reinterpret_cast<LPVOID*>(&Real_InternetOpenA),      reinterpret_cast<LPVOID>(Hook_InternetOpenA) },
@@ -2538,7 +4340,7 @@ DWORD WINAPI InitHooks(LPVOID)
 
     LogMessage("=== SocketUniversal network hook loading ===");
     LogMessage(
-        "config dump=%s max_bytes=%d headers=%s redact=%s console=%s jsonl=%s pipe=%s rotate=%llu/%d log=%s jsonl_file=%s pipe_name=%s",
+        "config dump=%s max_bytes=%d headers=%s redact=%s console=%s jsonl=%s pipe=%s websocket(capture=%s frames=%s frame_limit=%d preview=%d) scripts(file=%s exports=%s strings=%s graal=%s module=%s) rotate=%llu/%d log=%s jsonl_file=%s pipe_name=%s",
         g_Config.dumpData ? "on" : "off",
         g_Config.maxDumpBytes,
         g_Config.logHttpHeaders ? "on" : "off",
@@ -2546,6 +4348,15 @@ DWORD WINAPI InitHooks(LPVOID)
         g_Config.console ? "on" : "off",
         g_Config.jsonl ? "on" : "off",
         g_Config.namedPipe ? "on" : "off",
+        g_Config.webSocketCapture ? "on" : "off",
+        g_Config.webSocketFrameScan ? "on" : "off",
+        g_Config.maxWebSocketFramesPerBuffer,
+        g_Config.maxWebSocketFramePreviewBytes,
+        g_Config.scriptFileCapture ? "on" : "off",
+        g_Config.scriptExportScan ? "on" : "off",
+        g_Config.scriptStringScan ? "on" : "off",
+        g_Config.graalProbes ? "on" : "off",
+        g_Config.graalModuleFilter.c_str(),
         g_Config.rotateBytes,
         g_Config.rotateFiles,
         g_Config.logPath.c_str(),
